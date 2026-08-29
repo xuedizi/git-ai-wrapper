@@ -1,0 +1,188 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*-tac.v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example v1.7.0-tac.v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  patch-tests:
+    name: verify downstream patches
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run patched upstream regressions
+        shell: bash
+        run: scripts/test-patched-git-ai.sh
+
+  build:
+    name: build ${{ matrix.platform }}
+    needs: patch-tests
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            runner_arch: X64
+            exe: git-ai
+            artifact: git-ai-linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            runner_arch: ARM64
+            exe: git-ai
+            artifact: git-ai-linux-arm64
+          - platform: darwin/amd64
+            runner: macos-15-intel
+            runner_arch: X64
+            exe: git-ai
+            artifact: git-ai-darwin-amd64
+          - platform: darwin/arm64
+            runner: macos-15
+            runner_arch: ARM64
+            exe: git-ai
+            artifact: git-ai-darwin-arm64
+          - platform: windows/amd64
+            runner: windows-2025
+            runner_arch: X64
+            exe: git-ai.exe
+            artifact: git-ai-windows-amd64
+          - platform: windows/arm64
+            runner: windows-11-arm
+            runner_arch: ARM64
+            exe: git-ai.exe
+            artifact: git-ai-windows-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Check required tools
+        shell: bash
+        run: |
+          for tool in bash tar mktemp git cargo; do
+            command -v "$tool" >/dev/null || {
+              echo "missing required tool: $tool" >&2
+              exit 1
+            }
+          done
+      - name: Verify native runner architecture
+        shell: bash
+        run: |
+          if [ "$RUNNER_ARCH" != "${{ matrix.runner_arch }}" ]; then
+            echo "runner architecture mismatch: expected ${{ matrix.runner_arch }}, got $RUNNER_ARCH" >&2
+            exit 1
+          fi
+          echo "ARCH_EVIDENCE platform=${{ matrix.platform }} runner=$RUNNER_ARCH"
+      - name: Build git-ai sidecar
+        shell: bash
+        run: |
+          scripts/build-git-ai.sh --out dist/raw
+      - name: Verify executable architecture
+        shell: bash
+        run: |
+          binary_evidence=$(python3 scripts/verify-executable-arch.py \
+            --platform "${{ matrix.platform }}" \
+            --file "dist/raw/${{ matrix.exe }}")
+          read -r format_field machine_field _ <<<"$binary_evidence"
+          format=${format_field#format=}
+          machine=${machine_field#machine=}
+          echo "BINARY_EVIDENCE platform=${{ matrix.platform }} format=$format machine=$machine"
+      - name: Run native version smoke test
+        shell: bash
+        run: |
+          git_ai_version=$("dist/raw/${{ matrix.exe }}" --version)
+          echo "SMOKE_EVIDENCE platform=${{ matrix.platform }} version=$git_ai_version"
+      - name: Package sidecar
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+          fi
+          scripts/package-release.sh \
+            --version "$version" \
+            --platform "${{ matrix.platform }}" \
+            --input "dist/raw/${{ matrix.exe }}" \
+            --out dist/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/release/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/downloads
+      - name: Verify downloaded archives
+        shell: bash
+        run: python3 scripts/verify-release.py --archives-only --downloads dist/downloads
+      - name: Stage exact release archives
+        shell: bash
+        run: |
+          mkdir -p dist/release
+          artifacts=(
+            git-ai-linux-amd64
+            git-ai-linux-arm64
+            git-ai-darwin-amd64
+            git-ai-darwin-arm64
+            git-ai-windows-amd64
+            git-ai-windows-arm64
+          )
+          for artifact in "${artifacts[@]}"; do
+            cp "dist/downloads/$artifact/$artifact.tar.gz" dist/release/
+          done
+      - name: Generate manifest
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+          fi
+          upstream=$(cat patches/GIT_AI_VERSION)
+          scripts/generate-manifest.sh \
+            --version "$version" \
+            --upstream "$upstream" \
+            --dir dist/release \
+            --out dist/release/git-ai-manifest.json
+      - name: Verify manifest and staged release
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+          fi
+          upstream=$(cat patches/GIT_AI_VERSION)
+          python3 scripts/verify-release.py \
+            --manifest dist/release/git-ai-manifest.json \
+            --release-dir dist/release \
+            --version "$version" \
+            --upstream "$upstream"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+          fi
+          gh release create "$version" dist/release/*.tar.gz dist/release/git-ai-manifest.json \
+            --title "git-ai-wrapper $version" \
+            --notes "Patched git-ai-project/git-ai sidecar release for TAC."

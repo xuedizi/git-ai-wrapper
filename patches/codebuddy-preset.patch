@@ -1,0 +1,715 @@
+diff --git a/src/commands/checkpoint_agent/bash_tool.rs b/src/commands/checkpoint_agent/bash_tool.rs
+index 3dc8883..9990002 100644
+--- a/src/commands/checkpoint_agent/bash_tool.rs
++++ b/src/commands/checkpoint_agent/bash_tool.rs
+@@ -387,6 +387,11 @@ pub fn classify_tool(agent: Agent, tool_name: &str) -> ToolClass {
+                 _ => ToolClass::Skip,
+             }
+         }
++        Agent::Codebuddy => match tool_name.to_ascii_lowercase().as_str() {
++            "write" | "edit" | "multiedit" | "notebookedit" => ToolClass::FileEdit,
++            "bash" => ToolClass::Bash,
++            _ => ToolClass::Skip,
++        },
+     }
+ }
+ 
+@@ -405,6 +410,7 @@ pub enum Agent {
+     Windsurf,
+     Cursor,
+     Cline,
++    Codebuddy,
+ }
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/src/commands/checkpoint_agent/presets/codebuddy.rs b/src/commands/checkpoint_agent/presets/codebuddy.rs
+new file mode 100644
+index 0000000..79dd697
+--- /dev/null
++++ b/src/commands/checkpoint_agent/presets/codebuddy.rs
+@@ -0,0 +1,189 @@
++use super::parse;
++use super::{
++    AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
++    PresetContext, StreamFormat, StreamSource,
++};
++use crate::authorship::authorship_log_serialization::generate_session_id;
++use crate::authorship::working_log::AgentId;
++use crate::commands::checkpoint_agent::bash_tool::{self, Agent, ToolClass};
++use crate::error::GitAiError;
++use std::collections::HashMap;
++use std::path::{Path, PathBuf};
++
++pub struct CodebuddyPreset;
++
++impl AgentPreset for CodebuddyPreset {
++    fn parse(&self, hook_input: &str, trace_id: &str) -> Result<Vec<ParsedHookEvent>, GitAiError> {
++        let data: serde_json::Value = serde_json::from_str(hook_input)
++            .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
++
++        // CodeBuddy tool names match Claude Code (Write/Edit/MultiEdit/Bash).
++        let tool_class = parse::optional_str_multi(&data, &["tool_name", "toolName"])
++            .map(|name| bash_tool::classify_tool(Agent::Codebuddy, name))
++            .unwrap_or(ToolClass::FileEdit);
++        if tool_class == ToolClass::Skip {
++            return Ok(Vec::new());
++        }
++
++        let cwd = parse::required_str(&data, "cwd")?;
++        let transcript_path = parse::required_str(&data, "transcript_path")?;
++
++        // Session ID: prefer hook `session_id` / `sessionId`, fall back to the
++        // transcript filename stem (mirrors the Claude preset).
++        let session_id = parse::optional_str(&data, "session_id")
++            .or_else(|| parse::optional_str(&data, "sessionId"))
++            .map(|s| s.to_string())
++            .unwrap_or_else(|| {
++                parse::required_file_stem(&data, "transcript_path")
++                    .unwrap_or_else(|_| "unknown".to_string())
++            });
++
++        let hook_event = parse::optional_str_multi(&data, &["hook_event_name", "hookEventName"]);
++        let tool_use_id = parse::str_or_default_multi(&data, &["tool_use_id", "toolUseId"], "bash");
++
++        let is_bash = tool_class == ToolClass::Bash;
++
++        let context = PresetContext {
++            agent_id: AgentId {
++                tool: "codebuddy".to_string(),
++                id: session_id.clone(),
++                // CodeBuddy stores the model in a structured `providerData.model`
++                // field of its JSONL transcript.
++                model: crate::streams::model_extraction::extract_model(
++                    Path::new(transcript_path),
++                    crate::streams::sweep::StreamFormat::CodebuddyJsonl,
++                    None,
++                )
++                .ok()
++                .flatten()
++                .unwrap_or_else(|| "unknown".to_string()),
++            },
++            external_session_id: session_id.clone(),
++            trace_id: trace_id.to_string(),
++            cwd: PathBuf::from(cwd),
++            metadata: HashMap::from([("transcript_path".to_string(), transcript_path.to_string())]),
++        };
++
++        let transcript_path_buf = PathBuf::from(transcript_path);
++        // Subagent parent detection is intentionally not implemented in the
++        // first version; CodeBuddy transcripts are treated as top-level.
++        let stream_source = Some(StreamSource {
++            path: transcript_path_buf,
++            format: StreamFormat::CodebuddyJsonl,
++            session_id: generate_session_id(&session_id, "codebuddy"),
++            external_session_id: session_id.clone(),
++            external_parent_session_id: None,
++        });
++
++        let bash_command = parse::bash_command_from_hook_input(&data);
++        let event = match (hook_event, is_bash) {
++            (Some("PreToolUse"), true) => ParsedHookEvent::PreBashCall(PreBashCall {
++                context,
++                tool_use_id: tool_use_id.to_string(),
++                command: bash_command,
++            }),
++            (Some("PreToolUse"), false) => ParsedHookEvent::PreFileEdit(PreFileEdit {
++                context,
++                file_paths: parse::file_paths_from_tool_input(&data, cwd),
++                dirty_files: None,
++                tool_use_id: Some(tool_use_id.to_string()),
++            }),
++            (_, true) => ParsedHookEvent::PostBashCall(PostBashCall {
++                context,
++                tool_use_id: tool_use_id.to_string(),
++                command: bash_command,
++                stream_source,
++            }),
++            (_, false) => ParsedHookEvent::PostFileEdit(PostFileEdit {
++                context,
++                file_paths: parse::file_paths_from_tool_input(&data, cwd),
++                dirty_files: None,
++                stream_source,
++                tool_use_id: Some(tool_use_id.to_string()),
++            }),
++        };
++
++        Ok(vec![event])
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::commands::checkpoint_agent::presets::*;
++    use serde_json::json;
++
++    fn make_codebuddy_hook_input(event: &str, tool: &str) -> String {
++        json!({
++            "transcript_path": "/home/user/.codebuddy/projects/proj/abc123.jsonl",
++            "cwd": "/home/user/project",
++            "hook_event_name": event,
++            "tool_name": tool,
++            "session_id": "sess-1",
++            "tool_use_id": "tu-1",
++            "tool_input": {"file_path": "src/main.rs"}
++        })
++        .to_string()
++    }
++
++    #[test]
++    fn test_codebuddy_pre_file_edit() {
++        let input = make_codebuddy_hook_input("PreToolUse", "Write");
++        let events = CodebuddyPreset.parse(&input, "t_test123456789a").unwrap();
++        assert_eq!(events.len(), 1);
++        match &events[0] {
++            ParsedHookEvent::PreFileEdit(e) => {
++                assert_eq!(e.context.agent_id.tool, "codebuddy");
++                assert_eq!(e.context.external_session_id, "sess-1");
++                assert_eq!(e.file_paths, vec![PathBuf::from("/home/user/project/src/main.rs")]);
++            }
++            _ => panic!("Expected PreFileEdit"),
++        }
++    }
++
++    #[test]
++    fn test_codebuddy_post_file_edit() {
++        let input = make_codebuddy_hook_input("PostToolUse", "Write");
++        let events = CodebuddyPreset.parse(&input, "t_test123456789a").unwrap();
++        match &events[0] {
++            ParsedHookEvent::PostFileEdit(e) => {
++                assert_eq!(e.context.agent_id.tool, "codebuddy");
++                let ts = e.stream_source.as_ref().expect("stream source present");
++                assert_eq!(ts.format, StreamFormat::CodebuddyJsonl);
++                assert_eq!(ts.session_id, generate_session_id("sess-1", "codebuddy"));
++            }
++            _ => panic!("Expected PostFileEdit"),
++        }
++    }
++
++    #[test]
++    fn test_codebuddy_ignores_read_only_tools() {
++        for tool_name in ["Read", "Glob", "Grep"] {
++            let input = make_codebuddy_hook_input("PostToolUse", tool_name);
++            let events = CodebuddyPreset.parse(&input, "t_test123456789a").unwrap();
++            assert!(events.is_empty(), "{tool_name} unexpectedly produced events");
++        }
++    }
++
++    #[test]
++    fn test_codebuddy_session_id_from_filename() {
++        let input = json!({
++            "transcript_path": "/home/user/.codebuddy/projects/proj/9f8e7d6c-1234-abcd-5678-ef9012345678.jsonl",
++            "cwd": "/home/user/project",
++            "hook_event_name": "PostToolUse",
++            "tool_name": "Write",
++            "tool_input": {"file_path": "src/main.rs"}
++        })
++        .to_string();
++        let events = CodebuddyPreset.parse(&input, "t_test123456789a").unwrap();
++        match &events[0] {
++            ParsedHookEvent::PostFileEdit(e) => {
++                assert_eq!(
++                    e.context.external_session_id,
++                    "9f8e7d6c-1234-abcd-5678-ef9012345678"
++                );
++            }
++            _ => panic!("Expected PostFileEdit"),
++        }
++    }
++}
+diff --git a/src/commands/checkpoint_agent/presets/mod.rs b/src/commands/checkpoint_agent/presets/mod.rs
+index ca5828f..29f678a 100644
+--- a/src/commands/checkpoint_agent/presets/mod.rs
++++ b/src/commands/checkpoint_agent/presets/mod.rs
+@@ -5,6 +5,7 @@ mod ai_tab;
+ mod amp;
+ mod claude;
+ mod cline;
++mod codebuddy;
+ mod codex;
+ mod continue_cli;
+ mod cursor;
+@@ -124,6 +125,7 @@ pub enum StreamFormat {
+     AmpThreadJson,
+     OpenCodeSqlite,
+     PiJsonl,
++    CodebuddyJsonl,
+ }
+ 
+ impl StreamFormat {
+@@ -136,6 +138,7 @@ impl StreamFormat {
+             | Self::WindsurfJsonl
+             | Self::CodexJsonl
+             | Self::PiJsonl
++            | Self::CodebuddyJsonl
+             | Self::CopilotEventStreamJsonl => WatermarkType::ByteOffset,
+             Self::DroidJsonl => WatermarkType::Hybrid,
+             Self::CopilotSessionJson | Self::ContinueJson | Self::AmpThreadJson => {
+@@ -154,6 +157,7 @@ pub fn resolve_preset(name: &str) -> Result<Box<dyn AgentPreset>, GitAiError> {
+     match name {
+         "claude" => Ok(Box::new(claude::ClaudePreset)),
+         "cline" => Ok(Box::new(cline::ClinePreset)),
++        "codebuddy" => Ok(Box::new(codebuddy::CodebuddyPreset)),
+         "codex" => Ok(Box::new(codex::CodexPreset)),
+         "gemini" => Ok(Box::new(gemini::GeminiPreset)),
+         "windsurf" => Ok(Box::new(windsurf::WindsurfPreset)),
+diff --git a/src/mdm/agents/codebuddy.rs b/src/mdm/agents/codebuddy.rs
+new file mode 100644
+index 0000000..5998358
+--- /dev/null
++++ b/src/mdm/agents/codebuddy.rs
+@@ -0,0 +1,356 @@
++use crate::error::GitAiError;
++use crate::mdm::hook_installer::{HookCheckResult, HookInstaller, HookInstallerParams};
++use crate::mdm::utils::{
++    binary_exists, generate_diff, home_dir, is_git_ai_checkpoint_command,
++    normalize_windows_path_for_shell, write_atomic,
++};
++use serde_json::{Value, json};
++use std::fs;
++use std::path::{Path, PathBuf};
++
++// Command patterns for hooks
++const CODEBUDDY_PRE_TOOL_CMD: &str = "checkpoint codebuddy --hook-input stdin";
++const CODEBUDDY_POST_TOOL_CMD: &str = "checkpoint codebuddy --hook-input stdin";
++const CODEBUDDY_CATCH_ALL_MATCHER: &str = "*";
++
++pub struct CodebuddyInstaller;
++
++impl CodebuddyInstaller {
++    fn settings_path() -> PathBuf {
++        home_dir().join(".codebuddy").join("settings.json")
++    }
++
++    fn hook_status(settings: &Value) -> (bool, bool) {
++        let pre_tool_blocks = settings
++            .get("hooks")
++            .and_then(|h| h.get("PreToolUse"))
++            .and_then(|v| v.as_array());
++
++        let Some(blocks) = pre_tool_blocks else {
++            return (false, false);
++        };
++
++        let mut hooks_installed = false;
++        let mut hooks_up_to_date = false;
++
++        for block in blocks {
++            let is_catch_all = block
++                .get("matcher")
++                .and_then(|m| m.as_str())
++                .map(|m| m == CODEBUDDY_CATCH_ALL_MATCHER)
++                .unwrap_or(false);
++
++            let has_git_ai = block
++                .get("hooks")
++                .and_then(|h| h.as_array())
++                .map(|hooks| {
++                    hooks.iter().any(|hook| {
++                        hook.get("command")
++                            .and_then(|c| c.as_str())
++                            .map(is_git_ai_checkpoint_command)
++                            .unwrap_or(false)
++                    })
++                })
++                .unwrap_or(false);
++
++            if has_git_ai {
++                hooks_installed = true;
++                if is_catch_all {
++                    hooks_up_to_date = true;
++                }
++            }
++        }
++
++        (hooks_installed, hooks_up_to_date)
++    }
++
++    fn install_hooks_at(
++        settings_path: &Path,
++        params: &HookInstallerParams,
++        dry_run: bool,
++    ) -> Result<Option<String>, GitAiError> {
++        if let Some(dir) = settings_path.parent() {
++            fs::create_dir_all(dir)?;
++        }
++
++        let existing_content = if settings_path.exists() {
++            fs::read_to_string(settings_path)?
++        } else {
++            String::new()
++        };
++
++        let existing: Value = if existing_content.trim().is_empty() {
++            json!({})
++        } else {
++            serde_json::from_str(&existing_content)?
++        };
++
++        let binary_path_str = normalize_windows_path_for_shell(&params.binary_path);
++        let pre_tool_cmd = format!("{} {}", binary_path_str, CODEBUDDY_PRE_TOOL_CMD);
++        let post_tool_cmd = format!("{} {}", binary_path_str, CODEBUDDY_POST_TOOL_CMD);
++
++        let mut merged = existing.clone();
++        let mut hooks_obj = merged.get("hooks").cloned().unwrap_or_else(|| json!({}));
++
++        for (hook_type, desired_cmd) in &[
++            ("PreToolUse", &pre_tool_cmd),
++            ("PostToolUse", &post_tool_cmd),
++        ] {
++            let mut hook_type_array = hooks_obj
++                .get(*hook_type)
++                .and_then(|v| v.as_array())
++                .cloned()
++                .unwrap_or_default();
++
++            // Step 1: Strip git-ai from every non-catch-all matcher block (migration).
++            let mut emptied_by_migration = vec![false; hook_type_array.len()];
++            for (i, block) in hook_type_array.iter_mut().enumerate() {
++                let is_catch_all = block
++                    .get("matcher")
++                    .and_then(|m| m.as_str())
++                    .map(|m| m == CODEBUDDY_CATCH_ALL_MATCHER)
++                    .unwrap_or(false);
++                if !is_catch_all
++                    && let Some(hooks) = block.get_mut("hooks").and_then(|h| h.as_array_mut())
++                {
++                    let before = hooks.len();
++                    hooks.retain(|hook| {
++                        hook.get("command")
++                            .and_then(|c| c.as_str())
++                            .map(|cmd| !is_git_ai_checkpoint_command(cmd))
++                            .unwrap_or(true)
++                    });
++                    if hooks.is_empty() && before > 0 {
++                        emptied_by_migration[i] = true;
++                    }
++                }
++            }
++            let mut i = 0;
++            hook_type_array.retain(|_| {
++                let remove = emptied_by_migration[i];
++                i += 1;
++                !remove
++            });
++
++            // Step 2: Find or create the "*" catch-all matcher block.
++            let catch_all_idx = hook_type_array
++                .iter()
++                .position(|b| {
++                    b.get("matcher")
++                        .and_then(|m| m.as_str())
++                        .map(|m| m == CODEBUDDY_CATCH_ALL_MATCHER)
++                        .unwrap_or(false)
++                })
++                .unwrap_or_else(|| {
++                    hook_type_array.push(json!({
++                        "matcher": CODEBUDDY_CATCH_ALL_MATCHER,
++                        "hooks": []
++                    }));
++                    hook_type_array.len() - 1
++                });
++
++            // Step 3: Ensure exactly one git-ai command in the catch-all block.
++            let mut hooks_array = hook_type_array[catch_all_idx]
++                .get("hooks")
++                .and_then(|h| h.as_array())
++                .cloned()
++                .unwrap_or_default();
++
++            let mut found_idx: Option<usize> = None;
++            let mut needs_update = false;
++
++            for (idx, hook) in hooks_array.iter().enumerate() {
++                if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
++                    && is_git_ai_checkpoint_command(cmd)
++                    && found_idx.is_none()
++                {
++                    found_idx = Some(idx);
++                    if cmd != *desired_cmd {
++                        needs_update = true;
++                    }
++                }
++            }
++
++            match found_idx {
++                Some(idx) => {
++                    if needs_update {
++                        hooks_array[idx] = json!({
++                            "type": "command",
++                            "command": desired_cmd
++                        });
++                    }
++                    let keep_idx = idx;
++                    let mut current_idx = 0;
++                    hooks_array.retain(|hook| {
++                        if current_idx == keep_idx {
++                            current_idx += 1;
++                            true
++                        } else if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
++                            let is_dup = is_git_ai_checkpoint_command(cmd);
++                            current_idx += 1;
++                            !is_dup
++                        } else {
++                            current_idx += 1;
++                            true
++                        }
++                    });
++                }
++                None => {
++                    hooks_array.push(json!({
++                        "type": "command",
++                        "command": desired_cmd
++                    }));
++                }
++            }
++
++            if let Some(matcher_block) = hook_type_array[catch_all_idx].as_object_mut() {
++                matcher_block.insert("hooks".to_string(), Value::Array(hooks_array));
++            }
++
++            if let Some(obj) = hooks_obj.as_object_mut() {
++                obj.insert(hook_type.to_string(), Value::Array(hook_type_array));
++            }
++        }
++
++        if let Some(root) = merged.as_object_mut() {
++            root.insert("hooks".to_string(), hooks_obj);
++        }
++
++        if existing == merged {
++            return Ok(None);
++        }
++
++        let new_content = serde_json::to_string_pretty(&merged)?;
++        let diff_output = generate_diff(settings_path, &existing_content, &new_content);
++
++        if !dry_run {
++            write_atomic(settings_path, new_content.as_bytes())?;
++        }
++
++        Ok(Some(diff_output))
++    }
++
++    fn uninstall_hooks_at(
++        settings_path: &Path,
++        dry_run: bool,
++    ) -> Result<Option<String>, GitAiError> {
++        if !settings_path.exists() {
++            return Ok(None);
++        }
++
++        let existing_content = fs::read_to_string(settings_path)?;
++        let existing: Value = serde_json::from_str(&existing_content)?;
++
++        let mut merged = existing.clone();
++        let mut hooks_obj = match merged.get("hooks").cloned() {
++            Some(h) => h,
++            None => return Ok(None),
++        };
++
++        let mut changed = false;
++
++        for hook_type in &["PreToolUse", "PostToolUse"] {
++            if let Some(hook_type_array) =
++                hooks_obj.get_mut(*hook_type).and_then(|v| v.as_array_mut())
++            {
++                for matcher_block in hook_type_array.iter_mut() {
++                    if let Some(hooks_array) = matcher_block
++                        .get_mut("hooks")
++                        .and_then(|h| h.as_array_mut())
++                    {
++                        let original_len = hooks_array.len();
++                        hooks_array.retain(|hook| {
++                            if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
++                                !is_git_ai_checkpoint_command(cmd)
++                            } else {
++                                true
++                            }
++                        });
++                        if hooks_array.len() != original_len {
++                            changed = true;
++                        }
++                    }
++                }
++            }
++        }
++
++        if !changed {
++            return Ok(None);
++        }
++
++        if let Some(root) = merged.as_object_mut() {
++            root.insert("hooks".to_string(), hooks_obj);
++        }
++
++        let new_content = serde_json::to_string_pretty(&merged)?;
++        let diff_output = generate_diff(settings_path, &existing_content, &new_content);
++
++        if !dry_run {
++            write_atomic(settings_path, new_content.as_bytes())?;
++        }
++
++        Ok(Some(diff_output))
++    }
++}
++
++impl HookInstaller for CodebuddyInstaller {
++    fn name(&self) -> &str {
++        "CodeBuddy"
++    }
++
++    fn id(&self) -> &str {
++        "codebuddy"
++    }
++
++    fn check_hooks(&self, _params: &HookInstallerParams) -> Result<HookCheckResult, GitAiError> {
++        let has_binary = binary_exists("codebuddy");
++        let has_dotfiles = home_dir().join(".codebuddy").exists();
++
++        if !has_binary && !has_dotfiles {
++            return Ok(HookCheckResult {
++                tool_installed: false,
++                hooks_installed: false,
++                hooks_up_to_date: false,
++            });
++        }
++
++        let settings_path = Self::settings_path();
++        if !settings_path.exists() {
++            return Ok(HookCheckResult {
++                tool_installed: true,
++                hooks_installed: false,
++                hooks_up_to_date: false,
++            });
++        }
++
++        let content = fs::read_to_string(&settings_path)?;
++        let existing: Value = serde_json::from_str(&content).unwrap_or_else(|_| json!({}));
++        let (hooks_installed, hooks_up_to_date) = Self::hook_status(&existing);
++
++        Ok(HookCheckResult {
++            tool_installed: true,
++            hooks_installed,
++            hooks_up_to_date,
++        })
++    }
++
++    fn process_names(&self) -> Vec<&str> {
++        vec!["codebuddy"]
++    }
++
++    fn install_hooks(
++        &self,
++        params: &HookInstallerParams,
++        dry_run: bool,
++    ) -> Result<Option<String>, GitAiError> {
++        Self::install_hooks_at(&Self::settings_path(), params, dry_run)
++    }
++
++    fn uninstall_hooks(
++        &self,
++        _params: &HookInstallerParams,
++        dry_run: bool,
++    ) -> Result<Option<String>, GitAiError> {
++        Self::uninstall_hooks_at(&Self::settings_path(), dry_run)
++    }
++}
+diff --git a/src/mdm/agents/mod.rs b/src/mdm/agents/mod.rs
+index 105a6e9..8b6b2c1 100644
+--- a/src/mdm/agents/mod.rs
++++ b/src/mdm/agents/mod.rs
+@@ -1,6 +1,7 @@
+ mod amp;
+ mod claude_code;
+ mod cline;
++mod codebuddy;
+ mod codex;
+ mod cursor;
+ mod droid;
+@@ -18,6 +19,7 @@ mod windsurf;
+ pub use amp::AmpInstaller;
+ pub use claude_code::ClaudeCodeInstaller;
+ pub use cline::ClineInstaller;
++pub use codebuddy::CodebuddyInstaller;
+ pub use codex::CodexInstaller;
+ pub use cursor::CursorInstaller;
+ pub use droid::DroidInstaller;
+@@ -40,6 +42,7 @@ pub fn get_all_installers() -> Vec<Box<dyn HookInstaller>> {
+         Box::new(ClaudeCodeInstaller),
+         Box::new(ClineInstaller),
+         Box::new(CodexInstaller),
++        Box::new(CodebuddyInstaller),
+         Box::new(CursorInstaller),
+         Box::new(VSCodeInstaller),
+         Box::new(GitHubCopilotInstaller),
+diff --git a/src/streams/model_extraction.rs b/src/streams/model_extraction.rs
+index edce141..dc56c6e 100644
+--- a/src/streams/model_extraction.rs
++++ b/src/streams/model_extraction.rs
+@@ -27,6 +27,7 @@ pub fn extract_model(
+         | StreamFormat::CopilotEventStreamJsonl
+         | StreamFormat::GeminiJsonl => extract_model_from_jsonl_tail(path),
+         StreamFormat::CodexJsonl => extract_model_from_codex_jsonl(path),
++        StreamFormat::CodebuddyJsonl => extract_model_from_codebuddy_jsonl(path),
+         StreamFormat::CopilotSessionJson => extract_model_from_copilot_session_json(path),
+         StreamFormat::AmpThreadJson => extract_model_from_amp_thread_json(path),
+         StreamFormat::OpenCodeSqlite => extract_model_from_opencode_sqlite(path, session_id),
+@@ -128,6 +129,29 @@ fn extract_model_from_codex_jsonl(path: &Path) -> Result<Option<String>, StreamE
+     Ok(extract_model_from_codex_config(path))
+ }
+ 
++fn extract_model_from_codebuddy_jsonl(path: &Path) -> Result<Option<String>, StreamError> {
++    let (model, _) =
++        extract_model_from_jsonl_tail_with(path, extract_model_from_codebuddy_jsonl_line)?;
++    if model.is_some() {
++        return Ok(model);
++    }
++
++    Ok(extract_model_from_jsonl_head_with(path, extract_model_from_codebuddy_jsonl_line))
++}
++
++/// Extract the model from a single CodeBuddy JSONL transcript line.
++///
++/// CodeBuddy stores the model in a structured `providerData.model` field
++/// (unlike Claude, which embeds it in `message.model`). Falls back to
++/// `providerData.requestModelId`. Values are returned as-is (any
++/// `custom-local:` prefix is left intact for downstream normalization).
++fn extract_model_from_codebuddy_jsonl_line(line: &str) -> Option<String> {
++    let json = serde_json::from_str::<serde_json::Value>(line.trim()).ok()?;
++    let pd = json.get("providerData")?;
++    string_candidate(pd.get("model"))
++        .or_else(|| string_candidate(pd.get("requestModelId")))
++}
++
+ fn extract_model_from_jsonl_head_with(
+     path: &Path,
+     extract_from_line: fn(&str) -> Option<String>,
+diff --git a/src/streams/sweep.rs b/src/streams/sweep.rs
+index 3ae6136..88d09a7 100644
+--- a/src/streams/sweep.rs
++++ b/src/streams/sweep.rs
+@@ -42,6 +42,7 @@ pub enum StreamFormat {
+     OpenCodeSqlite,
+     PiJsonl,
+     CopilotOtelSqlite,
++    CodebuddyJsonl,
+ }
+ 
+ impl std::fmt::Display for StreamFormat {
+@@ -60,6 +61,7 @@ impl std::fmt::Display for StreamFormat {
+             Self::OpenCodeSqlite => write!(f, "OpenCodeSqlite"),
+             Self::PiJsonl => write!(f, "PiJsonl"),
+             Self::CopilotOtelSqlite => write!(f, "CopilotOtelSqlite"),
++            Self::CodebuddyJsonl => write!(f, "CodebuddyJsonl"),
+         }
+     }
+ }
+@@ -74,6 +76,7 @@ impl StreamFormat {
+             | Self::WindsurfJsonl
+             | Self::CodexJsonl
+             | Self::PiJsonl
++            | Self::CodebuddyJsonl
+             | Self::CopilotEventStreamJsonl => WatermarkType::ByteOffset,
+             Self::DroidJsonl => WatermarkType::Hybrid,
+             Self::CopilotSessionJson | Self::ContinueJson | Self::AmpThreadJson => {
