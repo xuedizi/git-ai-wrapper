@@ -17,7 +17,7 @@
 #                                         # checkout, drop into a shell so the
 #                                         # operator can resolve conflicts,
 #                                         # write the rebased patch back to
-#                                         # patches/codebuddy-preset.patch
+#                                         # the corresponding patch file
 #   scripts/build-git-ai.sh --help        # this text
 
 set -euo pipefail
@@ -35,7 +35,9 @@ inside every tcli-<os>-<arch>.tar.gz so end users get CodeBuddy attribution
 support without client-side Rust installation.
 
 Usage:
-  build-git-ai.sh --out <dir>       build, copy executable to <dir>
+  build-git-ai.sh --out <dir> --version <tag>
+                                    embed config/enterprise-metrics.release.json
+                                    (fixed repository path; no external override)
   build-git-ai.sh --rebase          apply patches to a fresh upstream
                                     checkout, drop into a shell so the
                                     operator can resolve conflicts, write
@@ -46,10 +48,13 @@ EOF
 
 OUT=""
 MODE=build
+ENTERPRISE_CONFIG="$ROOT_DIR/config/enterprise-metrics.release.json"
+WRAPPER_VERSION="${TAC_GIT_AI_WRAPPER_VERSION:-development}"
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--out)     OUT="$2"; shift 2 ;;
 		--out=*)   OUT="${1#*=}"; shift ;;
+		--version) WRAPPER_VERSION="$2"; shift 2 ;;
 		--rebase)  MODE=rebase; shift ;;
 		-h|--help) usage; exit 0 ;;
 		*)         echo "build-git-ai.sh: unknown arg: $1" >&2; usage >&2; exit 2 ;;
@@ -65,6 +70,12 @@ echo ">> build-git-ai.sh: upstream pin = $GIT_AI_VERSION"
 
 WORK=$(mktemp -d -t git-ai-build.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
+
+# Validate the fixed repository configuration before cloning; never print its contents.
+if [ "$MODE" = build ]; then
+    python3 "$SCRIPT_DIR/prepare-enterprise-config.py" \
+        --version "$WRAPPER_VERSION" --config "$ENTERPRISE_CONFIG" --out "$WORK/embedded.rs"
+fi
 
 GIT_AI_GIT_URL="${TAC_GIT_AI_GIT_URL:-https://github.com/git-ai-project/git-ai.git}"
 echo ">> cloning $GIT_AI_GIT_URL @ $GIT_AI_VERSION into $WORK/src"
@@ -82,12 +93,15 @@ BUILD_SHA=$(cd "$WORK/src" && git rev-parse --short HEAD)
 if [ "$MODE" = rebase ]; then
 	[ -t 0 ] || { echo "build-git-ai.sh: --rebase requires an interactive terminal (stdin is not a tty)" >&2; exit 1; }
 	echo ">> --rebase: spawning shell in $WORK/src. Resolve conflicts, then:"
-	echo "     git add -A && git diff --cached > $PATCH_DIR/codebuddy-preset.patch"
+	echo "     Review and regenerate each patch separately under $PATCH_DIR."
+	echo "     Do not overwrite codebuddy-preset.patch with the combined diff."
 	echo "     exit"
 	(cd "$WORK/src" && "$SHELL")
 	echo ">> rebase shell exited; patch presumed updated on disk"
 	exit 0
 fi
+
+cp "$WORK/embedded.rs" "$WORK/src/src/enterprise_metrics/embedded.rs"
 
 [ -n "$OUT" ] || { echo "build-git-ai.sh: --out required for build mode" >&2; exit 2; }
 mkdir -p "$OUT"
@@ -95,7 +109,7 @@ mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd -P)
 
 echo ">> building standalone git-ai executable via cargo (release)"
-(cd "$WORK/src" && cargo build --release)
+(cd "$WORK/src" && cargo build --locked --release)
 
 exe="$WORK/src/target/release/git-ai"
 if [ -f "$WORK/src/target/release/git-ai.exe" ]; then

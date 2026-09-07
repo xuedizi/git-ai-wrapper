@@ -36,11 +36,12 @@ fi
 
 expected_patch_names=(
 	"codebuddy-preset.patch"
+	"enterprise-metrics.patch"
 )
 actual_patch_names=$(printf '%s\n' "${active_patch_names[@]}")
 expected_patch_names_text=$(printf '%s\n' "${expected_patch_names[@]}")
 [ "$actual_patch_names" = "$expected_patch_names_text" ] || {
-	echo "test-patched-git-ai.sh: expected exactly active codebuddy-preset.patch; got: $actual_patch_names" >&2
+	echo "test-patched-git-ai.sh: expected active codebuddy-preset.patch and enterprise-metrics.patch; got: $actual_patch_names" >&2
 	exit 1
 }
 
@@ -61,5 +62,9 @@ for patch_file in "${active_patch_files[@]}"; do
 	(cd "$WORK/src" && git apply "$patch_file")
 done
 
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 echo ">> running patched upstream tests (cargo test)"
-(cd "$WORK/src" && cargo test --lib)
+(cd "$WORK/src" && cargo test --locked --lib)
+(cd "$WORK/src" && cargo test --locked --test integration enterprise_metrics)
+
+(cd "$WORK/src" && cargo test --locked --test integration test_edge_extension_recovery_metric_copies_source_session_tool_and_model)

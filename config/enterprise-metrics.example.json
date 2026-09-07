@@ -1,0 +1,24 @@
+{
+  "enabled": false,
+  "organization_id": "replace-with-company-organization-id",
+  "identity_secret": "replace-with-a-stable-organization-secret-at-least-32-bytes",
+  "max_bytes": 104857600,
+  "commit_reserved_bytes": 20971520,
+  "retention_secs": 2592000,
+  "destinations": [
+    {
+      "id": "autopai-production",
+      "endpoint": "https://api.auto-pai.cn/prxoy/api/aiCodeAddition/upload",
+      "event_types": [
+        "checkpoint",
+        "commit"
+      ],
+      "min_interval_ms": 500,
+      "ack": {
+        "mode": "unconfirmed"
+      },
+      "adapter": "autopai-v1",
+      "token": "replace-with-company-upload-token"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "enabled": true,
+  "organization_id": "tinnove",
+  "identity_secret": "bd8f536341386a6bc3575d147e707675ace2909c73cd79d69568b7c178e9e0d8",
+  "max_bytes": 104857600,
+  "commit_reserved_bytes": 20971520,
+  "retention_secs": 2592000,
+  "destinations": [
+    {
+      "id": "autopai-production",
+      "endpoint": "https://api.auto-pai.cn/prxoy/api/aiCodeAddition/upload",
+      "event_types": [
+        "checkpoint",
+        "commit"
+      ],
+      "min_interval_ms": 500,
+      "ack": {
+        "mode": "json",
+        "pointer": "/success",
+        "equals": true
+      },
+      "adapter": "autopai-v1",
+      "token": "70a38da88fe44100a8251335f3395140"
+    }
+  ]
+}

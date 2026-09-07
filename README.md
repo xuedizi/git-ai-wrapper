@@ -9,12 +9,12 @@ Release tags use:
 v<upstream-git-ai-version>-tac.v<wrapper-version>
 ```
 
-For example, `v1.7.0-tac.v0.1.0` is built from
-`git-ai-project/git-ai@v1.7.0` as wrapper release `v0.1.0`.
+For example, `v1.7.0-tac.v0.2.0` is built from
+`git-ai-project/git-ai@v1.7.0` as wrapper release `v0.2.0`.
 
 ## Downstream scope
 
-The wrapper intentionally carries one active downstream patch:
+The wrapper intentionally carries two active downstream patches:
 
 - `codebuddy-preset.patch` adds first-class CodeBuddy support. CodeBuddy's
   hook protocol is compatible with Claude Code, but its transcript stores the
@@ -24,9 +24,13 @@ The wrapper intentionally carries one active downstream patch:
   and a `CodebuddyInstaller` that writes hooks into `~/.codebuddy/settings.json`.
   Subagent-parent detection is intentionally deferred to a later version.
 
+- `enterprise-metrics.patch` adds opt-in checkpoint/commit enterprise telemetry with publisher-embedded configuration and automatic Git email/remote identity:
+  transactional inbox/outbox, allowlisted DTOs, independently acknowledged
+  destinations, retry/backoff, and daemon control commands. See
+  [enterprise telemetry setup](docs/enterprise-metrics.md).
+
 General git-ai attribution, blame, stats, and Git-Notes behavior remains
-upstream `git-ai` 1.7.0. The narrow downstream patch owns only CodeBuddy preset
-and hook-installer support. TCLI owns orchestration and invokes:
+upstream `git-ai` 1.7.0. CodeBuddy integration and enterprise delivery are maintained as separate patches. TCLI owns orchestration and invokes:
 
 ```bash
 git ai install-hooks
@@ -38,9 +42,12 @@ git ai stats --json
 ```text
 patches/GIT_AI_VERSION        upstream git-ai-project/git-ai tag
 patches/codebuddy-preset.patch
+patches/enterprise-metrics.patch
+config/enterprise-metrics.release.json  fixed publisher settings (enabled by default)
 disabled-patches/             inactive source archives (none currently)
 scripts/build-git-ai.sh       clone, patch, and cargo-build git-ai / git-ai.exe
 scripts/test-patched-git-ai.sh
+scripts/prepare-enterprise-config.py
 scripts/package-release.sh
 scripts/generate-manifest.sh
 scripts/verify-executable-arch.py
@@ -51,18 +58,22 @@ scripts/verify-release.py
 ## Local smoke
 
 ```bash
-bash scripts/build-git-ai.sh --out dist/raw
+bash scripts/build-git-ai.sh --out dist/raw --version v1.7.0-tac.v0.2.0
 bash scripts/package-release.sh \
-  --version v1.7.0-tac.v0.1.0 \
+  --version v1.7.0-tac.v0.2.0 \
   --platform "$(go env GOOS)/$(go env GOARCH)" \
   --input dist/raw/git-ai \
   --out dist/release
 scripts/generate-manifest.sh \
-  --version v1.7.0-tac.v0.1.0 \
+  --version v1.7.0-tac.v0.2.0 \
   --upstream "$(cat patches/GIT_AI_VERSION)" \
   --dir dist/release \
   --out dist/release/git-ai-manifest.json
 ```
+
+Builds always embed `config/enterprise-metrics.release.json` (enabled by default).
+Maintain publisher fields there and pass the intended release tag with `--version`;
+end users never edit telemetry configuration. No GitHub configuration secret is needed.
 
 ## Release platforms
 
@@ -78,8 +89,8 @@ platform:
 | `windows/amd64` | `windows-2025` | `git-ai.exe` |
 | `windows/arm64` | `windows-11-arm` | `git-ai.exe` |
 
-The `patch-tests` job applies the active patch to a clean pinned checkout and
-runs `cargo test` before any native release build starts.
+The `patch-tests` job applies both active patches to a clean pinned checkout and
+runs the library suite and enterprise TestRepo integration test before any native release build starts.
 
 Remove the CodeBuddy patch only after a released upstream tag contains both the
 source behavior and equivalent regression coverage. Rollback must restore the

@@ -1,0 +1,2702 @@
+diff --git a/src/authorship/attribution_recovery.rs b/src/authorship/attribution_recovery.rs
+index 42d49f6d7..e0460dcd6 100644
+--- a/src/authorship/attribution_recovery.rs
++++ b/src/authorship/attribution_recovery.rs
+@@ -354,6 +354,7 @@ fn recover_bash_mtime(
+     committed_hunks: &HashMap<String, Vec<LineRange>>,
+     captured_file_timestamps: Option<&FileTimestampsByPath>,
+ ) -> Result<(), GitAiError> {
++    let enterprise_attrs = std::cell::OnceCell::new();
+     let repo_work_dir = repo_worktree_key(repo)?;
+     let workdir = repo.workdir()?;
+     let unknown_by_file = unknown_lines_by_file(authorship_log, committed_hunks);
+@@ -443,6 +444,9 @@ fn recover_bash_mtime(
+             "candidate_count": candidates.len(),
+         });
+         record_recovery_metric(RecoveryMetricInput {
++            enterprise_attrs: enterprise_attrs.get_or_init(|| {
++                crate::enterprise_metrics::identity::capture(repo, EventAttributes::new())
++            }),
+             repo,
+             parent_sha,
+             commit_sha,
+@@ -476,6 +480,7 @@ fn recover_session_event_mtime(
+     captured_file_timestamps: Option<&FileTimestampsByPath>,
+     metrics_db_unavailable: &mut bool,
+ ) -> Result<(), GitAiError> {
++    let enterprise_attrs = std::cell::OnceCell::new();
+     let workdir = repo.workdir()?;
+     let unknown_by_file = unknown_lines_by_file(authorship_log, committed_hunks);
+     if unknown_by_file.is_empty() {
+@@ -574,6 +579,9 @@ fn recover_session_event_mtime(
+             "candidate_count": candidates.len(),
+         });
+         record_recovery_metric(RecoveryMetricInput {
++            enterprise_attrs: enterprise_attrs.get_or_init(|| {
++                crate::enterprise_metrics::identity::capture(repo, EventAttributes::new())
++            }),
+             repo,
+             parent_sha,
+             commit_sha,
+@@ -607,6 +615,7 @@ fn recover_commit_metadata(
+     captured_file_timestamps: Option<&FileTimestampsByPath>,
+     metrics_db_unavailable: &mut bool,
+ ) -> Result<bool, GitAiError> {
++    let enterprise_attrs = std::cell::OnceCell::new();
+     if unknown_by_file.is_empty() {
+         return Ok(true);
+     }
+@@ -684,6 +693,9 @@ fn recover_commit_metadata(
+             "latest_file_timestamps_ns": latest_timestamps,
+         });
+         record_recovery_metric(RecoveryMetricInput {
++            enterprise_attrs: enterprise_attrs.get_or_init(|| {
++                crate::enterprise_metrics::identity::capture(repo, EventAttributes::new())
++            }),
+             repo,
+             parent_sha,
+             commit_sha,
+@@ -1293,6 +1305,7 @@ fn recover_adjacent_edges(
+     authorship_log: &mut AuthorshipLog,
+     committed_hunks: &HashMap<String, Vec<LineRange>>,
+ ) {
++    let enterprise_attrs = std::cell::OnceCell::new();
+     let unknown = unknown_lines_by_file(authorship_log, committed_hunks);
+     for (file_path, unknown_lines) in unknown {
+         let line_to_author = line_author_map(authorship_log, &file_path);
+@@ -1340,6 +1353,9 @@ fn recover_adjacent_edges(
+                 "recovered_lines": &recovery.lines,
+             });
+             record_recovery_metric(RecoveryMetricInput {
++                enterprise_attrs: enterprise_attrs.get_or_init(|| {
++                    crate::enterprise_metrics::identity::capture(repo, EventAttributes::new())
++                }),
+                 repo,
+                 parent_sha,
+                 commit_sha,
+@@ -1872,6 +1888,7 @@ fn add_attestation_ranges(
+ }
+ 
+ struct RecoveryMetricInput<'a> {
++    enterprise_attrs: &'a EventAttributes,
+     repo: &'a Repository,
+     parent_sha: &'a str,
+     commit_sha: &'a str,
+@@ -1940,6 +1957,7 @@ fn record_recovery_metric(input: RecoveryMetricInput<'_>) {
+         attrs = attrs.branch(short_branch);
+     }
+     attrs = attrs.author(input.author_id);
++    attrs.custom_attributes = input.enterprise_attrs.custom_attributes.clone();
+ 
+     let event = MetricEvent::from_values_with_timestamp(values, attrs.to_sparse(), input.event_ts);
+     crate::observability::log_metrics(vec![event]);
+diff --git a/src/authorship/post_commit.rs b/src/authorship/post_commit.rs
+index e29ef4dea..c203ed9e4 100644
+--- a/src/authorship/post_commit.rs
++++ b/src/authorship/post_commit.rs
+@@ -440,10 +440,11 @@ where
+ 
+     if options.compute_stats {
+         let stats_diff_base = single_commit_diff_base(&parent_sha, &commit_sha);
+-        let is_merge_commit = repo
++        let commit_parent_count = repo
+             .find_commit(commit_sha.clone())
+-            .map(|commit| commit.parent_count().unwrap_or(0) > 1)
+-            .unwrap_or(false);
++            .and_then(|commit| commit.parent_count())
++            .ok();
++        let is_merge_commit = commit_parent_count.is_some_and(|count| count > 1);
+         let ignore_patterns = effective_ignore_patterns(repo, &[], &[]);
+         skip_reason = if is_merge_commit {
+             Some(StatsSkipReason::MergeCommit)
+@@ -495,6 +496,7 @@ where
+                 &computed,
+                 &parent_working_log,
+                 hunks_json.as_deref(),
++                commit_parent_count,
+             );
+             stats = Some(computed);
+         }
+@@ -1112,7 +1114,10 @@ pub(crate) fn commit_metric_attrs(
+         attrs = attrs.branch(short_branch);
+     }
+ 
+-    attrs.custom_attributes_map(Config::fresh().custom_attributes())
++    crate::enterprise_metrics::identity::capture(
++        repo,
++        attrs.custom_attributes_map(Config::fresh().custom_attributes()),
++    )
+ }
+ 
+ /// Record metrics for a committed change.
+@@ -1127,6 +1132,7 @@ fn record_commit_metrics(
+     stats: &crate::authorship::stats::CommitStats,
+     checkpoints: &[Checkpoint],
+     hunks_json: Option<&str>,
++    commit_parent_count: Option<usize>,
+ ) {
+     use crate::metrics::{CommittedValues, record};
+ 
+@@ -1179,7 +1185,20 @@ fn record_commit_metrics(
+         values.hunks_null()
+     };
+ 
+-    let attrs = commit_metric_attrs(repo, commit_sha, parent_sha, human_author);
++    let mut attrs = commit_metric_attrs(repo, commit_sha, parent_sha, human_author);
++    // Reuse the parent count already observed by stats preflight. No extra Git
++    // lookup is introduced, and unknown counts remain unknown for telemetry.
++    let mut extra = attrs
++        .custom_attributes
++        .as_ref()
++        .and_then(|v| v.as_ref())
++        .and_then(|s| serde_json::from_str::<std::collections::HashMap<String, String>>(s).ok())
++        .unwrap_or_default();
++    extra.remove("tac_commit_parent_count");
++    if let Some(count) = commit_parent_count {
++        extra.insert("tac_commit_parent_count".into(), count.to_string());
++    }
++    attrs = attrs.custom_attributes_map(&extra);
+ 
+     // Record the metric
+     record(values, attrs);
+diff --git a/src/commands/git_ai_handlers.rs b/src/commands/git_ai_handlers.rs
+index be1c942ea..0bf675864 100644
+--- a/src/commands/git_ai_handlers.rs
++++ b/src/commands/git_ai_handlers.rs
+@@ -80,6 +80,25 @@ pub fn handle_git_ai(args: &[String]) {
+     }
+ 
+     match args[0].as_str() {
++        "enterprise-telemetry" => {
++            let action = args.get(1).map(String::as_str).unwrap_or("status");
++            if args.len() > 2 || !matches!(action, "status" | "flush" | "retry") {
++                eprintln!("Usage: git-ai enterprise-telemetry [status|flush|retry]");
++                std::process::exit(2);
++            }
++            let request = crate::daemon::control_api::ControlRequest::EnterpriseTelemetry {
++                action: action.into(),
++            };
++            match crate::daemon::telemetry_handle::send_via_daemon(&request) {
++                Ok(response) if response.ok => {
++                    println!("{}", response.data.unwrap_or(serde_json::Value::Null))
++                }
++                _ => {
++                    eprintln!("enterprise telemetry control failed; check daemon status");
++                    std::process::exit(1);
++                }
++            }
++        }
+         "help" | "--help" | "-h" => {
+             print_help();
+         }
+diff --git a/src/daemon.rs b/src/daemon.rs
+index 359de5a4d..f93263790 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -7182,6 +7182,13 @@ impl ActorDaemonCoordinator {
+     async fn handle_control_request(&self, request: ControlRequest) -> ControlResponse {
+         let result = match request {
+             ControlRequest::Ping => Ok(ControlResponse::ok(None, None)),
++            ControlRequest::EnterpriseTelemetry { action } => {
++                tokio::task::spawn_blocking(move || crate::enterprise_metrics::control(&action))
++                    .await
++                    .map_err(|_| GitAiError::Generic("enterprise control task failed".into()))
++                    .and_then(|result| result)
++                    .map(|value| ControlResponse::ok(None, Some(value)))
++            }
+             ControlRequest::CheckpointRun { .. } => Err(GitAiError::Generic(
+                 "checkpoint.run requires the framed checkpoint transport".to_string(),
+             )),
+diff --git a/src/daemon/checkpoint.rs b/src/daemon/checkpoint.rs
+index ffea6ac4e..d61854610 100644
+--- a/src/daemon/checkpoint.rs
++++ b/src/daemon/checkpoint.rs
+@@ -254,7 +254,7 @@ fn build_checkpoint_attrs(
+         attrs = attrs.branch(short_branch);
+     }
+ 
+-    attrs
++    crate::enterprise_metrics::identity::capture(repo, attrs)
+ }
+ 
+ pub fn execute_resolved_checkpoint_from_daemon(
+diff --git a/src/daemon/control_api.rs b/src/daemon/control_api.rs
+index 50d0752b6..f811e2e6d 100644
+--- a/src/daemon/control_api.rs
++++ b/src/daemon/control_api.rs
+@@ -10,6 +10,8 @@ use std::collections::HashMap;
+ pub enum ControlRequest {
+     #[serde(rename = "ping")]
+     Ping,
++    #[serde(rename = "enterprise.telemetry")]
++    EnterpriseTelemetry { action: String },
+     #[serde(rename = "checkpoint.run")]
+     CheckpointRun { body_bytes: u64 },
+     #[serde(rename = "sync.family")]
+diff --git a/src/daemon/telemetry_worker.rs b/src/daemon/telemetry_worker.rs
+index e15fc220b..3872b3079 100644
+--- a/src/daemon/telemetry_worker.rs
++++ b/src/daemon/telemetry_worker.rs
+@@ -586,6 +586,7 @@ pub fn spawn_telemetry_worker() -> DaemonTelemetryWorkerHandle {
+     let daemon_id = daemon_run_id().to_string();
+     let telemetry_runtime = crate::tokio_runtime::telemetry_runtime();
+ 
++    crate::enterprise_metrics::spawn();
+     spawn_metrics_metadata_backfill(telemetry_runtime);
+ 
+     telemetry_runtime.spawn(metrics_persist_loop(metrics_persist_rx));
+diff --git a/src/enterprise_metrics/config.rs b/src/enterprise_metrics/config.rs
+new file mode 100644
+index 000000000..62aa7f73a
+--- /dev/null
++++ b/src/enterprise_metrics/config.rs
+@@ -0,0 +1,236 @@
++//! Enterprise settings are independent of upstream cloud authentication.
++use serde::{Deserialize, Serialize};
++use serde_json::Value;
++use sha2::{Digest, Sha256};
++use std::collections::HashSet;
++use std::sync::{Arc, OnceLock, RwLock};
++
++#[derive(Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Settings {
++    #[serde(default)]
++    pub enabled: bool,
++    pub organization_id: String,
++    #[serde(skip, default = "client_version")]
++    pub client_version: String,
++    pub identity_secret: String,
++    pub destinations: Vec<Destination>,
++    #[serde(default = "max_bytes")]
++    pub max_bytes: u64,
++    #[serde(default = "reserved_bytes")]
++    pub commit_reserved_bytes: u64,
++    #[serde(default = "retention_secs")]
++    pub retention_secs: u64,
++}
++fn max_bytes() -> u64 {
++    100 * 1024 * 1024
++}
++fn reserved_bytes() -> u64 {
++    20 * 1024 * 1024
++}
++fn retention_secs() -> u64 {
++    30 * 86400
++}
++#[derive(Clone, Copy, Default, Serialize, Deserialize)]
++pub enum Adapter {
++    #[default]
++    #[serde(rename = "autopai-v1")]
++    AutoPaiV1,
++}
++
++#[derive(Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct Destination {
++    #[serde(default)]
++    pub adapter: Adapter,
++    pub id: String,
++    pub endpoint: String,
++    // Never copy credentials into the durable destination snapshot or status output.
++    #[serde(default, skip_serializing)]
++    pub token: String,
++    #[serde(default)]
++    pub ack: Ack,
++    #[serde(default)]
++    pub event_types: Vec<String>,
++    #[serde(default = "interval_ms")]
++    pub min_interval_ms: u64,
++}
++fn interval_ms() -> u64 {
++    500
++}
++#[derive(Clone, Default, Serialize, Deserialize)]
++#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
++pub enum Ack {
++    #[default]
++    Unconfirmed,
++    #[serde(rename = "http_200")]
++    Http200,
++    Json {
++        pointer: String,
++        equals: Value,
++        event_id_pointer: Option<String>,
++    },
++}
++impl Destination {
++    /// Bind old work to its original destination, never silently redirect it.
++    pub fn binding(&self) -> String {
++        digest(
++            &serde_json::to_string(&(&self.id, &self.adapter, &self.endpoint, "embedded-v2"))
++                .expect("strings serialize"),
++        )
++    }
++    pub fn token(&self) -> Option<String> {
++        let token = self.token.trim();
++        if token.is_empty() || token.contains(['\r', '\n']) {
++            None
++        } else {
++            Some(token.into())
++        }
++    }
++}
++fn client_version() -> String {
++    super::embedded::WRAPPER_VERSION.into()
++}
++impl Settings {
++    pub fn validate(&self) -> Result<(), String> {
++        if self.organization_id.is_empty()
++            || self.organization_id.len() > 256
++            || self.client_version.len() > 128
++            || self.client_version.is_empty()
++            || self.identity_secret.len() < 32
++            || self.identity_secret.len() > 1024
++        {
++            return Err("organization_id, client_version and identity_secret (at least 32 bytes) are required".into());
++        }
++        if self.destinations.is_empty()
++            || self.destinations.len() > 8
++            || self.max_bytes == 0
++            || self.commit_reserved_bytes >= self.max_bytes
++            || !(60..=365 * 86400).contains(&self.retention_secs)
++        {
++            return Err("invalid destination count or queue limits".into());
++        }
++        let mut ids = HashSet::new();
++        for dest in &self.destinations {
++            let url = url::Url::parse(&dest.endpoint).map_err(|_| "invalid endpoint")?;
++            if url.scheme() != "https"
++                || url.host_str().is_none()
++                || !url.username().is_empty()
++                || url.password().is_some()
++                || url.query().is_some()
++                || url.fragment().is_some()
++            {
++                return Err("endpoint must be HTTPS without credentials, query or fragment".into());
++            }
++            if dest.endpoint.len() > 2048
++                || dest.id.len() > 128
++                || dest.token.len() > 8192
++                || dest.id.is_empty()
++                || !ids.insert(&dest.id)
++                || dest.token().is_none()
++                || dest.min_interval_ms < 100
++                || dest.min_interval_ms > 60000
++                || dest
++                    .event_types
++                    .iter()
++                    .any(|t| t != "checkpoint" && t != "commit")
++            {
++                return Err(
++                    "invalid destination ID, token reference, event types or request interval"
++                        .into(),
++                );
++            }
++            if let Ack::Json {
++                pointer,
++                event_id_pointer,
++                ..
++            } = &dest.ack
++                && (!pointer.starts_with('/')
++                    || event_id_pointer
++                        .as_ref()
++                        .is_some_and(|p| !p.starts_with('/')))
++            {
++                return Err("ack fields must be JSON pointers".into());
++            }
++        }
++        Ok(())
++    }
++    pub fn identity_binding(&self) -> String {
++        digest(&format!(
++            "repository-email-url-v2\0{}",
++            self.identity_secret
++        ))
++    }
++    pub fn opaque(&self, kind: &str, value: &str) -> String {
++        // HMAC-SHA256, implemented using the existing SHA-256 dependency.
++        let mut key = [0u8; 64];
++        let secret = self.identity_secret.as_bytes();
++        if secret.len() > 64 {
++            key[..32].copy_from_slice(&Sha256::digest(secret));
++        } else {
++            key[..secret.len()].copy_from_slice(secret);
++        }
++        let inner_pad = key.map(|b| b ^ 0x36);
++        let outer_pad = key.map(|b| b ^ 0x5c);
++        let message =
++            serde_json::to_vec(&(&self.organization_id, kind, value)).expect("strings serialize");
++        let mut inner = Sha256::new();
++        inner.update(inner_pad);
++        inner.update(message);
++        let mut outer = Sha256::new();
++        outer.update(outer_pad);
++        outer.update(inner.finalize());
++        format!("{kind}-{:x}", outer.finalize())
++    }
++}
++pub fn digest(value: &str) -> String {
++    format!("{:x}", Sha256::digest(value.as_bytes()))
++}
++
++static SETTINGS: OnceLock<RwLock<Option<Arc<Settings>>>> = OnceLock::new();
++static ERROR: OnceLock<RwLock<Option<String>>> = OnceLock::new();
++pub fn current() -> Option<Arc<Settings>> {
++    SETTINGS
++        .get_or_init(|| RwLock::new(None))
++        .read()
++        .ok()?
++        .clone()
++}
++pub fn last_error() -> Option<String> {
++    ERROR.get_or_init(|| RwLock::new(None)).read().ok()?.clone()
++}
++fn load() -> Result<Option<Settings>, String> {
++    // Only test-support binaries accept an external fixture. Production uses embedded data.
++    #[cfg(any(test, feature = "test-support"))]
++    if let Some(path) = std::env::var_os("GIT_AI_TEST_ENTERPRISE_CONFIG") {
++        let bytes = std::fs::read(path).map_err(|_| "cannot read enterprise test config")?;
++        return parse(&bytes);
++    }
++    parse(super::embedded::CONFIG.as_bytes())
++}
++pub(super) fn parse(bytes: &[u8]) -> Result<Option<Settings>, String> {
++    let value: Value =
++        serde_json::from_slice(bytes).map_err(|_| "invalid enterprise config JSON")?;
++    if value.get("enabled").and_then(Value::as_bool) == Some(false) {
++        return Ok(None);
++    }
++    let settings: Settings =
++        serde_json::from_value(value).map_err(|_| "invalid enterprise config JSON")?;
++    settings.validate()?;
++    Ok(Some(settings))
++}
++pub fn reload() {
++    let loaded = load();
++    let (settings, error) = match loaded {
++        Ok(v) => (v.map(Arc::new), None),
++        Err(e) => (None, Some(e)),
++    };
++    *SETTINGS
++        .get_or_init(|| RwLock::new(None))
++        .write()
++        .expect("settings lock") = settings;
++    *ERROR
++        .get_or_init(|| RwLock::new(None))
++        .write()
++        .expect("error lock") = error;
++}
+diff --git a/src/enterprise_metrics/domain.rs b/src/enterprise_metrics/domain.rs
+new file mode 100644
+index 000000000..7dba7f728
+--- /dev/null
++++ b/src/enterprise_metrics/domain.rs
+@@ -0,0 +1,65 @@
++use serde::{Deserialize, Serialize};
++#[derive(Clone, Serialize, Deserialize)]
++pub struct Event {
++    pub schema_version: u32,
++    pub event_id: String,
++    pub event_timestamp: String,
++    pub client_version: String,
++    pub organization_id: String,
++    pub user_id: String,
++    pub repo_id: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub tool: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub model: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub session_id: Option<String>,
++    #[serde(flatten)]
++    pub payload: Payload,
++}
++#[derive(Clone, Serialize, Deserialize)]
++#[serde(tag = "event_type", rename_all = "snake_case")]
++pub enum Payload {
++    Checkpoint(Checkpoint),
++    Commit(Commit),
++}
++#[derive(Clone, Serialize, Deserialize)]
++pub struct Checkpoint {
++    pub kind: String,
++    pub measurement_mode: String,
++    pub lines_added: u32,
++    pub lines_deleted: u32,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub lines_added_sloc: Option<u32>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub lines_deleted_sloc: Option<u32>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub file_id: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub tool_use_id: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub trace_id: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub edit_kind: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub checkpoint_type: Option<String>,
++}
++#[derive(Clone, Serialize, Deserialize)]
++pub struct Commit {
++    pub commit_id: String,
++    pub committed_at: String,
++    pub git_diff_added_lines: u32,
++    pub git_diff_deleted_lines: u32,
++    pub ai_additions: u32,
++    pub human_additions: u32,
++    pub unknown_additions: u32,
++    pub tool_model_breakdown: Vec<Breakdown>,
++    pub is_rewrite: bool,
++    pub is_merge: bool,
++}
++#[derive(Clone, Serialize, Deserialize)]
++pub struct Breakdown {
++    pub tool: String,
++    pub model: String,
++    pub ai_additions: u32,
++}
+diff --git a/src/enterprise_metrics/embedded.rs b/src/enterprise_metrics/embedded.rs
+new file mode 100644
+index 000000000..597f1c3e3
+--- /dev/null
++++ b/src/enterprise_metrics/embedded.rs
+@@ -0,0 +1,4 @@
++// Replaced by git-ai-wrapper/scripts/prepare-enterprise-config.py for formal builds.
++// Developer and test builds have no credentials and never enable production upload.
++pub const CONFIG: &str = r#"{"enabled":false}"#;
++pub const WRAPPER_VERSION: &str = "development";
+diff --git a/src/enterprise_metrics/identity.rs b/src/enterprise_metrics/identity.rs
+new file mode 100644
+index 000000000..c84d01398
+--- /dev/null
++++ b/src/enterprise_metrics/identity.rs
+@@ -0,0 +1,91 @@
++//! Repository identity is captured once per metric batch, outside trace ingestion.
++//! Never resolve mutable repository state while projecting or retrying a delivery.
++use crate::{git::repository::Repository, metrics::EventAttributes};
++use std::collections::{BTreeMap, HashMap};
++const USER: &str = "tac_enterprise_user_email";
++const REPO: &str = "tac_enterprise_repo_url";
++
++pub fn capture(repo: &Repository, attrs: EventAttributes) -> EventAttributes {
++    let mut extra: HashMap<String, String> = attrs
++        .custom_attributes
++        .as_ref()
++        .and_then(|v| v.as_ref())
++        .and_then(|v| serde_json::from_str(v).ok())
++        .unwrap_or_default();
++    // Reserved fields cannot be supplied by a user custom-attributes override.
++    extra.remove(USER);
++    extra.remove(REPO);
++    if let Ok(config) = repo.enterprise_config_snapshot() {
++        if let Some(email) = config.string("user.email") {
++            let email = email.to_string();
++            if !email.trim().is_empty() {
++                extra.insert(USER.into(), email.trim().into());
++            }
++        }
++        // Read one effective config snapshot. No git subprocesses or per-file work.
++        let mut remotes = BTreeMap::new();
++        for section in config.sections() {
++            if section.header().name().eq_ignore_ascii_case(b"remote")
++                && let Some(name) = section.header().subsection_name()
++            {
++                let value = remotes.entry(name.to_string()).or_insert(None);
++                if let Some(url) = section.body().value("url") {
++                    *value = Some(url.to_string());
++                }
++            }
++        }
++        let remote = remotes.get("origin").or_else(|| {
++            if remotes.len() == 1 {
++                remotes.values().next()
++            } else {
++                None
++            }
++        });
++        if let Some(url) = remote
++            .and_then(|url| url.as_deref())
++            .and_then(normalize_url)
++        {
++            extra.insert(REPO.into(), url);
++        }
++    }
++    attrs.custom_attributes_map(&extra)
++}
++
++pub fn from_attrs(attrs: &EventAttributes) -> (Option<String>, Option<String>) {
++    let extra: HashMap<String, String> = attrs
++        .custom_attributes
++        .as_ref()
++        .and_then(|v| v.as_ref())
++        .and_then(|v| serde_json::from_str(v).ok())
++        .unwrap_or_default();
++    let user = extra.get(USER).filter(|s| !s.trim().is_empty()).cloned();
++    let repo = extra.get(REPO).and_then(|s| normalize_url(s));
++    (user, repo)
++}
++
++/// Canonical repository identity, not an HTTP transport URL. Preserve nonstandard
++/// ports so different repositories never collapse into one enterprise identifier.
++fn normalize_url(raw: &str) -> Option<String> {
++    let raw = raw.trim();
++    let expanded;
++    let source = if !raw.contains("://") {
++        let (host, path) = raw.split_once(':')?;
++        if host.len() <= 1 || host.contains('/') || path.is_empty() {
++            return None;
++        }
++        expanded = format!("ssh://{host}/{}", path.trim_start_matches('/'));
++        expanded.as_str()
++    } else {
++        raw
++    };
++    let source_url = url::Url::parse(source).ok()?;
++    let normalized = crate::repo_url::normalize_repo_url(source).ok()?;
++    let mut normalized = url::Url::parse(&normalized).ok()?;
++    if let Some(port) = source_url.port()
++        && !matches!((source_url.scheme(), port), ("ssh", 22) | ("git", 9418))
++    {
++        // set_port keeps distinct endpoints while removing HTTPS's default 443.
++        normalized.set_port(Some(port)).ok()?;
++    }
++    Some(normalized.to_string())
++}
+diff --git a/src/enterprise_metrics/mod.rs b/src/enterprise_metrics/mod.rs
+new file mode 100644
+index 000000000..fe1a58cd7
+--- /dev/null
++++ b/src/enterprise_metrics/mod.rs
+@@ -0,0 +1,20 @@
++//! Optional enterprise telemetry; disabled unless explicitly configured.
++pub mod config;
++pub mod domain;
++mod embedded;
++pub mod identity;
++pub mod projection;
++pub mod sink;
++pub mod store;
++pub mod transport;
++mod worker;
++
++pub use worker::{control, spawn};
++pub fn now() -> u64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_secs()
++}
++#[cfg(test)]
++mod tests;
+diff --git a/src/enterprise_metrics/projection.rs b/src/enterprise_metrics/projection.rs
+new file mode 100644
+index 000000000..82adc1a6d
+--- /dev/null
++++ b/src/enterprise_metrics/projection.rs
+@@ -0,0 +1,211 @@
++use super::{config::Settings, domain::*};
++use crate::metrics::events::{checkpoint_pos as cp, committed_pos as cm};
++use crate::metrics::types::SparseArray;
++use crate::metrics::{EventAttributes, MetricEvent, PosEncoded};
++use serde_json::Value;
++
++#[derive(Debug, PartialEq, Eq)]
++pub enum ProjectionError {
++    WaitingIdentity,
++    Invalid(&'static str),
++    Unsupported,
++}
++fn string(map: &SparseArray, pos: usize) -> Option<&str> {
++    map.get(&pos.to_string())
++        .and_then(Value::as_str)
++        .filter(|s| !s.is_empty())
++}
++fn number(map: &SparseArray, pos: usize) -> Result<u32, ProjectionError> {
++    map.get(&pos.to_string())
++        .and_then(Value::as_u64)
++        .and_then(|n| n.try_into().ok())
++        .ok_or(ProjectionError::Invalid("missing_or_invalid_count"))
++}
++fn optional_number(map: &SparseArray, pos: usize) -> Result<Option<u32>, ProjectionError> {
++    match map.get(&pos.to_string()) {
++        None | Some(Value::Null) => Ok(None),
++        _ => number(map, pos).map(Some),
++    }
++}
++fn timestamp(ts: u64) -> Result<String, ProjectionError> {
++    i64::try_from(ts)
++        .ok()
++        .and_then(|v| chrono::DateTime::from_timestamp(v, 0))
++        .map(|v| v.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
++        .ok_or(ProjectionError::Invalid("invalid_timestamp"))
++}
++fn attr(field: &Option<Option<String>>) -> Option<String> {
++    field
++        .as_ref()
++        .and_then(|v| v.clone())
++        .filter(|s| !s.is_empty())
++}
++
++pub fn project(raw: &MetricEvent, cfg: &Settings, id: &str) -> Result<Event, ProjectionError> {
++    if raw.event_id != 1 && raw.event_id != 4 {
++        return Err(ProjectionError::Unsupported);
++    }
++    let attrs = EventAttributes::from_sparse(&raw.attrs);
++    let (user_id, repo_id) = super::identity::from_attrs(&attrs);
++    let user_id = user_id.ok_or(ProjectionError::WaitingIdentity)?;
++    let repo_id = repo_id.ok_or(ProjectionError::WaitingIdentity)?;
++    let mut tool = attr(&attrs.tool);
++    let mut model = attr(&attrs.model);
++    let mut session_id = attr(&attrs.session_id).map(|s| cfg.opaque("session", &s));
++    let mut ts = u64::from(raw.timestamp);
++    let v = &raw.values;
++    let payload = if raw.event_id == 4 {
++        let kind = match string(v, cp::KIND) {
++            Some("human") => "unknown",
++            Some("known_human") => "known_human",
++            Some("ai_agent") => "ai_agent",
++            Some("ai_tab") => "ai_tab",
++            _ => return Err(ProjectionError::Invalid("unsupported_checkpoint_kind")),
++        };
++        let checkpoint_type = string(v, cp::CHECKPOINT_TYPE).map(str::to_owned);
++        let mode = match checkpoint_type.as_deref() {
++            None => "direct",
++            Some(
++                "recovered_bash"
++                | "recovered_session_event_mtime"
++                | "recovered_commit_metadata"
++                | "recovered_edge_extension",
++            ) => "recovery",
++            _ => return Err(ProjectionError::Invalid("unsupported_checkpoint_type")),
++        };
++        if let Some(value) = v.get(&cp::CHECKPOINT_TS.to_string())
++            && !value.is_null()
++        {
++            ts = value
++                .as_u64()
++                .ok_or(ProjectionError::Invalid("invalid_checkpoint_timestamp"))?;
++        }
++        let edit_kind = string(v, cp::EDIT_KIND).map(str::to_owned);
++        if edit_kind
++            .as_deref()
++            .is_some_and(|s| s != "file_edit" && s != "bash")
++        {
++            return Err(ProjectionError::Invalid("unsupported_edit_kind"));
++        }
++        Payload::Checkpoint(Checkpoint {
++            kind: kind.into(),
++            measurement_mode: mode.into(),
++            lines_added: number(v, cp::LINES_ADDED)?,
++            lines_deleted: number(v, cp::LINES_DELETED)?,
++            lines_added_sloc: optional_number(v, cp::LINES_ADDED_SLOC)?,
++            lines_deleted_sloc: optional_number(v, cp::LINES_DELETED_SLOC)?,
++            file_id: string(v, cp::FILE_PATH)
++                .map(|s| cfg.opaque("file", &format!("{repo_id}\0{}", s.replace('\\', "/")))),
++            tool_use_id: string(v, cp::TOOL_USE_ID).map(|s| {
++                cfg.opaque(
++                    "tool-use",
++                    &format!("{}\0{s}", session_id.as_deref().unwrap_or("")),
++                )
++            }),
++            trace_id: attr(&attrs.trace_id).map(|s| cfg.opaque("trace", &s)),
++            edit_kind,
++            checkpoint_type,
++        })
++    } else {
++        let parent_count = attr(&attrs.custom_attributes)
++            .and_then(|s| {
++                serde_json::from_str::<std::collections::HashMap<String, String>>(&s).ok()
++            })
++            .and_then(|m| {
++                m.get("tac_commit_parent_count")
++                    .and_then(|s| s.parse::<u32>().ok())
++            })
++            .ok_or(ProjectionError::Invalid("missing_commit_parent_count"))?;
++        if parent_count > 1 {
++            return Err(ProjectionError::Unsupported);
++        }
++        let pairs = v
++            .get(&cm::TOOL_MODEL_PAIRS.to_string())
++            .and_then(Value::as_array)
++            .ok_or(ProjectionError::Invalid("missing_breakdown"))?;
++        let counts = v
++            .get(&cm::AI_ADDITIONS.to_string())
++            .and_then(Value::as_array)
++            .ok_or(ProjectionError::Invalid("missing_breakdown_counts"))?;
++        if pairs.len() != counts.len() || pairs.first().and_then(Value::as_str) != Some("all") {
++            return Err(ProjectionError::Invalid("invalid_breakdown"));
++        }
++        let ai: u32 = counts
++            .first()
++            .and_then(Value::as_u64)
++            .and_then(|n| n.try_into().ok())
++            .ok_or(ProjectionError::Invalid("invalid_ai_count"))?;
++        let mut breakdown = Vec::new();
++        let mut sum = 0u64;
++        let mut seen = std::collections::HashSet::new();
++        for (pair, count) in pairs.iter().zip(counts).skip(1) {
++            let pair = pair
++                .as_str()
++                .ok_or(ProjectionError::Invalid("invalid_tool_model"))?;
++            if !seen.insert(pair) {
++                return Err(ProjectionError::Invalid("duplicate_tool_model"));
++            }
++            let (t, m) = pair
++                .split_once("::")
++                .ok_or(ProjectionError::Invalid("invalid_tool_model"))?;
++            let n: u32 = count
++                .as_u64()
++                .and_then(|n| n.try_into().ok())
++                .ok_or(ProjectionError::Invalid("invalid_ai_count"))?;
++            sum += u64::from(n);
++            breakdown.push(Breakdown {
++                tool: t.into(),
++                model: m.into(),
++                ai_additions: n,
++            });
++        }
++        if sum != u64::from(ai) {
++            return Err(ProjectionError::Invalid("breakdown_total_mismatch"));
++        }
++        let added = number(v, cm::GIT_DIFF_ADDED_LINES)?;
++        let human = number(v, cm::HUMAN_ADDITIONS)?;
++        let unknown = added
++            .checked_sub(ai)
++            .and_then(|n| n.checked_sub(human))
++            .ok_or(ProjectionError::Invalid("attribution_exceeds_total"))?;
++        // A commit can contain multiple sessions. Upstream attrs do not establish a unique one.
++        session_id = None;
++        tool = None;
++        model = None;
++        if breakdown.len() == 1 {
++            tool = Some(breakdown[0].tool.clone());
++            model = Some(breakdown[0].model.clone());
++        }
++        let commit =
++            attr(&attrs.commit_sha).ok_or(ProjectionError::Invalid("missing_commit_id"))?;
++        let committed = v
++            .get(&cm::COMMIT_TS.to_string())
++            .and_then(Value::as_u64)
++            .ok_or(ProjectionError::Invalid("missing_commit_timestamp"))?;
++        Payload::Commit(Commit {
++            commit_id: commit,
++            committed_at: timestamp(committed)?,
++            git_diff_added_lines: added,
++            git_diff_deleted_lines: number(v, cm::GIT_DIFF_DELETED_LINES)?,
++            ai_additions: ai,
++            human_additions: human,
++            unknown_additions: unknown,
++            tool_model_breakdown: breakdown,
++            is_rewrite: false,
++            is_merge: false,
++        })
++    };
++    Ok(Event {
++        schema_version: 1,
++        event_id: id.into(),
++        event_timestamp: timestamp(ts)?,
++        client_version: cfg.client_version.clone(),
++        organization_id: cfg.organization_id.clone(),
++        user_id,
++        repo_id,
++        tool,
++        model,
++        session_id,
++        payload,
++    })
++}
+diff --git a/src/enterprise_metrics/sink.rs b/src/enterprise_metrics/sink.rs
+new file mode 100644
+index 000000000..addc7cbdc
+--- /dev/null
++++ b/src/enterprise_metrics/sink.rs
+@@ -0,0 +1,108 @@
++//! Only this adapter knows the AutoPai HTTP contract.
++use super::config::{Ack, Destination};
++use super::transport::{HttpTransport, UreqTransport};
++use serde_json::{Value, json};
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Outcome {
++    Accepted,
++    Retry(Option<u64>),
++    AuthBlocked,
++    TargetBlocked,
++    ProtocolBlocked,
++    Rejected,
++}
++/// HTTP and domain classification are separate from durable scheduling.
++pub trait EventSink {
++    fn deliver(&self, payload: &str, id: &str) -> Outcome;
++}
++pub struct AutoPaiSink<'a> {
++    pub destination: &'a Destination,
++}
++impl EventSink for AutoPaiSink<'_> {
++    fn deliver(&self, payload: &str, id: &str) -> Outcome {
++        let dest = self.destination;
++        if matches!(dest.ack, Ack::Unconfirmed) {
++            return Outcome::ProtocolBlocked;
++        }
++        let Some(token) = dest.token() else {
++            return Outcome::AuthBlocked;
++        };
++        let Ok(value) = serde_json::from_str::<Value>(payload) else {
++            return Outcome::Rejected;
++        };
++        let body = json!({"completeData":value}).to_string();
++        let Ok(response) = UreqTransport.post_json(&dest.endpoint, "token", &token, &body) else {
++            return Outcome::Retry(None);
++        };
++        match response.body {
++            Some(body) => classify(
++                response.status,
++                &body,
++                response.retry_after.as_deref(),
++                &dest.ack,
++                id,
++            ),
++            None if response.status == 200 => Outcome::ProtocolBlocked,
++            None => classify(
++                response.status,
++                b"",
++                response.retry_after.as_deref(),
++                &dest.ack,
++                id,
++            ),
++        }
++    }
++}
++pub fn classify(status: u16, body: &[u8], retry: Option<&str>, ack: &Ack, id: &str) -> Outcome {
++    match status {
++        200 => match ack {
++            Ack::Unconfirmed => Outcome::ProtocolBlocked,
++            Ack::Http200 => Outcome::Accepted,
++            Ack::Json {
++                pointer,
++                equals,
++                event_id_pointer,
++            } => {
++                let success = serde_json::from_slice::<Value>(body).ok().is_some_and(|v| {
++                    v.pointer(pointer) == Some(equals)
++                        && event_id_pointer
++                            .as_ref()
++                            .is_none_or(|p| v.pointer(p).and_then(Value::as_str) == Some(id))
++                });
++                if success {
++                    Outcome::Accepted
++                } else {
++                    Outcome::ProtocolBlocked
++                }
++            }
++        },
++        401 | 403 => Outcome::AuthBlocked,
++        404 | 405 | 300..=399 => Outcome::TargetBlocked,
++        408 | 429 | 500..=599 => Outcome::Retry(retry.and_then(retry_after)),
++        413 => Outcome::Rejected,
++        // 400/422/409 are not assumed to be event validation or duplicate ACKs
++        // until the service contract actually defines those bodies.
++        _ => Outcome::ProtocolBlocked,
++    }
++}
++fn retry_after(value: &str) -> Option<u64> {
++    if let Ok(seconds) = value.parse::<u64>() {
++        return Some(seconds.min(7 * 86400));
++    }
++    chrono::DateTime::parse_from_rfc2822(value)
++        .ok()
++        .map(|date| {
++            date.timestamp()
++                .saturating_sub(chrono::Utc::now().timestamp())
++                .clamp(0, 7 * 86400) as u64
++        })
++}
++
++/// The worker depends on this registry and EventSink, not a vendor constructor.
++/// Register another adapter here without changing queue/retry policy.
++pub fn for_destination(destination: &Destination) -> Box<dyn EventSink + '_> {
++    match destination.adapter {
++        super::config::Adapter::AutoPaiV1 => Box::new(AutoPaiSink { destination }),
++    }
++}
+diff --git a/src/enterprise_metrics/store.rs b/src/enterprise_metrics/store.rs
+new file mode 100644
+index 000000000..e5faef3fa
+--- /dev/null
++++ b/src/enterprise_metrics/store.rs
+@@ -0,0 +1,360 @@
++//! SQLite-owned inbox/outbox. No network or filesystem calls inside transactions.
++use super::{
++    config::{Destination, Settings},
++    projection::{ProjectionError, project},
++    sink::Outcome,
++};
++use crate::metrics::{EventAttributes, MetricEvent, PosEncoded};
++use rusqlite::{Connection, OptionalExtension, Transaction, params};
++use serde_json::{Value, json};
++
++pub type Result<T> = std::result::Result<T, crate::error::GitAiError>;
++pub fn initialize(conn: &Connection) -> Result<()> {
++    conn.execute_batch(r#"
++    CREATE TABLE IF NOT EXISTS enterprise_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
++    INSERT OR IGNORE INTO enterprise_meta VALUES('version','1');
++    INSERT OR IGNORE INTO enterprise_meta VALUES('epoch',lower(hex(randomblob(16))));
++    CREATE TABLE IF NOT EXISTS enterprise_inbox(
++        source_id INTEGER PRIMARY KEY,event_id TEXT NOT NULL UNIQUE,kind TEXT NOT NULL,
++        org TEXT NOT NULL,identity_binding TEXT NOT NULL,client_version TEXT NOT NULL,
++        destinations TEXT NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,
++        bytes INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'waiting',error TEXT,
++        frozen_user TEXT,frozen_repo TEXT,next_project_at INTEGER NOT NULL DEFAULT 0);
++    CREATE INDEX IF NOT EXISTS enterprise_inbox_waiting ON enterprise_inbox(state,org,source_id);
++    CREATE TABLE IF NOT EXISTS enterprise_usage(id INTEGER PRIMARY KEY CHECK(id=1),bytes INTEGER NOT NULL);
++    INSERT OR IGNORE INTO enterprise_usage SELECT 1,COALESCE(SUM(bytes),0) FROM enterprise_inbox;
++    CREATE TRIGGER IF NOT EXISTS enterprise_charge_insert AFTER INSERT ON enterprise_inbox
++        BEGIN UPDATE enterprise_usage SET bytes=bytes+new.bytes WHERE id=1; END;
++    CREATE TRIGGER IF NOT EXISTS enterprise_charge_delete AFTER DELETE ON enterprise_inbox
++        BEGIN UPDATE enterprise_usage SET bytes=bytes-old.bytes WHERE id=1; END;
++    CREATE TABLE IF NOT EXISTS enterprise_events(
++        event_id TEXT PRIMARY KEY,kind TEXT NOT NULL,org TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL);
++    CREATE TABLE IF NOT EXISTS enterprise_deliveries(
++        event_id TEXT NOT NULL,destination_id TEXT NOT NULL,binding TEXT NOT NULL,
++        state TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,
++        next_retry_at INTEGER NOT NULL DEFAULT 0,lease TEXT,lease_until INTEGER,ack_at INTEGER,error TEXT,
++        PRIMARY KEY(event_id,destination_id));
++    CREATE INDEX IF NOT EXISTS enterprise_delivery_due ON enterprise_deliveries(destination_id,binding,state,next_retry_at);
++    CREATE TABLE IF NOT EXISTS enterprise_targets(
++        binding TEXT PRIMARY KEY,state TEXT NOT NULL DEFAULT 'ready',next_request INTEGER NOT NULL DEFAULT 0);
++    CREATE TABLE IF NOT EXISTS enterprise_type_blocks(binding TEXT NOT NULL,kind TEXT NOT NULL,PRIMARY KEY(binding,kind));
++    CREATE TABLE IF NOT EXISTS enterprise_loss(
++        kind TEXT NOT NULL,reason TEXT NOT NULL,count INTEGER NOT NULL,first_at INTEGER NOT NULL,last_at INTEGER NOT NULL,
++        PRIMARY KEY(kind,reason));
++    "#)?;
++    let version: String = conn.query_row(
++        "SELECT value FROM enterprise_meta WHERE key='version'",
++        [],
++        |r| r.get(0),
++    )?;
++    if version != "1" {
++        return Err(crate::error::GitAiError::Generic(
++            "unsupported enterprise database version".into(),
++        ));
++    }
++    Ok(())
++}
++fn loss(conn: &Connection, kind: &str, reason: &str, now: u64) -> Result<()> {
++    conn.execute("INSERT INTO enterprise_loss VALUES(?1,?2,1,?3,?3) ON CONFLICT(kind,reason) DO UPDATE SET count=count+1,last_at=excluded.last_at",params![kind,reason,now])?;
++    Ok(())
++}
++/// Called in the same transaction as the source insert, only on the persistence worker.
++pub fn capture(
++    tx: &Transaction<'_>,
++    source_id: i64,
++    kind: u16,
++    source_bytes: usize,
++    cfg: &Settings,
++    now: u64,
++) -> Result<()> {
++    if !cfg.enabled || !matches!(kind, 1 | 4) {
++        return Ok(());
++    }
++    if tx
++        .query_row(
++            "SELECT 1 FROM enterprise_inbox WHERE source_id=?1",
++            [source_id],
++            |r| r.get::<_, i32>(0),
++        )
++        .optional()?
++        .is_some()
++    {
++        return Ok(());
++    }
++    let kind = if kind == 1 { "commit" } else { "checkpoint" };
++    let destinations = serde_json::to_string(&cfg.destinations)?;
++    let bytes = source_bytes as u64 + destinations.len() as u64 + 4096;
++    let used: u64 = tx.query_row("SELECT bytes FROM enterprise_usage WHERE id=1", [], |r| {
++        r.get(0)
++    })?;
++    let limit = if kind == "commit" {
++        cfg.max_bytes
++    } else {
++        cfg.max_bytes - cfg.commit_reserved_bytes
++    };
++    if used.saturating_add(bytes) > limit {
++        loss(tx, kind, "capacity", now)?;
++        return Ok(());
++    }
++    let raw: String = tx.query_row(
++        "SELECT event_json FROM metrics WHERE id=?1",
++        [source_id],
++        |r| r.get(0),
++    )?;
++    let attrs = serde_json::from_str::<MetricEvent>(&raw)
++        .ok()
++        .map(|e| EventAttributes::from_sparse(&e.attrs))
++        .unwrap_or_default();
++    let (user, repo) = super::identity::from_attrs(&attrs);
++    let event_id = crate::uuid::generate_v4();
++    // The UUID is written once with the source row; replay uses the unique source_id.
++    tx.execute("INSERT INTO enterprise_inbox(source_id,event_id,kind,org,identity_binding,client_version,destinations,created_at,expires_at,bytes,frozen_user,frozen_repo) VALUES(?1,?12,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
++        params![source_id,kind,cfg.organization_id,cfg.identity_binding(),cfg.client_version,
++            destinations,now,now.saturating_add(cfg.retention_secs),bytes,user,repo,event_id])?;
++    Ok(())
++}
++/// A bounded batch of pure projections; source identity snapshots stay pinned to the original scope.
++pub fn project_pending(conn: &mut Connection, cfg: &Settings, now: u64) -> Result<()> {
++    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
++    let rows = {
++        let mut stmt=tx.prepare("SELECT i.source_id,i.event_id,m.event_json,i.destinations,i.client_version,i.frozen_user,i.frozen_repo FROM enterprise_inbox i JOIN metrics m ON m.id=i.source_id WHERE i.state='waiting' AND i.org=?1 AND i.identity_binding=?2 AND i.expires_at>?3 AND i.next_project_at<=?3 ORDER BY i.next_project_at,i.source_id LIMIT 50")?;
++        stmt.query_map(
++            params![cfg.organization_id, cfg.identity_binding(), now],
++            |r| {
++                Ok((
++                    r.get::<_, i64>(0)?,
++                    r.get::<_, String>(1)?,
++                    r.get::<_, String>(2)?,
++                    r.get::<_, String>(3)?,
++                    r.get::<_, String>(4)?,
++                    r.get::<_, Option<String>>(5)?,
++                    r.get::<_, Option<String>>(6)?,
++                ))
++            },
++        )?
++        .collect::<std::result::Result<Vec<_>, _>>()?
++    };
++    for (source_id, id, raw, destinations, client_version, frozen_user, frozen_repo) in rows {
++        let event = serde_json::from_str::<MetricEvent>(&raw)
++            .map_err(|_| ProjectionError::Invalid("invalid_source_json"))
++            .and_then(|raw| project(&raw, cfg, &id));
++        match event {
++            Ok(mut event) => {
++                event.client_version = client_version;
++                event.user_id = frozen_user.unwrap_or(event.user_id);
++                event.repo_id = frozen_repo.unwrap_or(event.repo_id);
++                let payload = serde_json::to_string(&event)?;
++                let kind = match event.payload {
++                    super::domain::Payload::Checkpoint(_) => "checkpoint",
++                    _ => "commit",
++                };
++                tx.execute(
++                    "INSERT OR IGNORE INTO enterprise_events VALUES(?1,?2,?3,?4,?5)",
++                    params![id, kind, event.organization_id, payload, now],
++                )?;
++                for dest in serde_json::from_str::<Vec<Destination>>(&destinations)? {
++                    tx.execute("INSERT OR IGNORE INTO enterprise_deliveries(event_id,destination_id,binding) VALUES(?1,?2,?3)",params![id,dest.id,dest.binding()])?;
++                }
++                tx.execute(
++                    "UPDATE enterprise_inbox SET state='projected',error=NULL WHERE source_id=?1",
++                    [source_id],
++                )?;
++            }
++            Err(ProjectionError::WaitingIdentity) => {
++                tx.execute("UPDATE enterprise_inbox SET error='waiting_identity',next_project_at=?2 WHERE source_id=?1",params![source_id,now+60])?;
++            }
++            Err(error) => {
++                let reason = match error {
++                    ProjectionError::Invalid(reason) => reason,
++                    _ => "unsupported_event",
++                };
++                tx.execute(
++                    "UPDATE enterprise_inbox SET state='quarantined',error=?2 WHERE source_id=?1",
++                    params![source_id, reason],
++                )?;
++            }
++        }
++    }
++    tx.commit()?;
++    Ok(())
++}
++#[derive(Debug)]
++pub struct Delivery {
++    pub event_id: String,
++    pub destination_id: String,
++    pub binding: String,
++    pub payload: String,
++    pub lease: String,
++    pub attempts: u32,
++}
++pub fn claim(
++    conn: &mut Connection,
++    dest: &Destination,
++    org: &str,
++    kind: &str,
++    now: u64,
++) -> Result<Option<Delivery>> {
++    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
++    let binding = dest.binding();
++    tx.execute(
++        "INSERT OR IGNORE INTO enterprise_targets(binding) VALUES(?1)",
++        [&binding],
++    )?;
++    let ready: bool = tx.query_row(
++        "SELECT state='ready' AND next_request<=?2 FROM enterprise_targets WHERE binding=?1",
++        params![binding, now],
++        |r| r.get(0),
++    )?;
++    if !ready {
++        return Ok(None);
++    }
++    let blocked: bool = tx.query_row(
++        "SELECT EXISTS(SELECT 1 FROM enterprise_type_blocks WHERE binding=?1 AND kind=?2)",
++        params![binding, kind],
++        |r| r.get(0),
++    )?;
++    if blocked {
++        return Ok(None);
++    }
++    let row=tx.query_row("SELECT d.event_id,e.payload,d.attempts FROM enterprise_deliveries d JOIN enterprise_events e ON d.event_id=e.event_id JOIN enterprise_inbox i ON i.event_id=e.event_id WHERE d.destination_id=?1 AND d.binding=?2 AND e.org=?3 AND e.kind=?4 AND i.expires_at>?5 AND ((d.state='pending' AND d.next_retry_at<=?5) OR (d.state='inflight' AND d.lease_until<=?5)) ORDER BY i.source_id LIMIT 1",
++        params![dest.id,binding,org,kind,now],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?))).optional()?;
++    let Some((id, payload, attempts)) = row else {
++        return Ok(None);
++    };
++    let lease: String = tx.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
++    tx.execute("UPDATE enterprise_deliveries SET state='inflight',lease=?2,lease_until=?3,attempts=attempts+1 WHERE event_id=?1 AND destination_id=?4",params![id,lease,now+120,dest.id])?;
++    tx.commit()?;
++    Ok(Some(Delivery {
++        event_id: id,
++        destination_id: dest.id.clone(),
++        binding,
++        payload,
++        lease,
++        attempts: attempts.saturating_add(1),
++    }))
++}
++pub fn finish(conn: &mut Connection, job: &Delivery, outcome: &Outcome, now: u64) -> Result<bool> {
++    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
++    let (state, error) = match outcome {
++        Outcome::Accepted => ("delivered", None),
++        Outcome::Retry(_) => ("pending", Some("retryable")),
++        Outcome::AuthBlocked => ("auth_blocked", Some("credentials")),
++        Outcome::TargetBlocked => ("target_blocked", Some("endpoint")),
++        Outcome::ProtocolBlocked => ("protocol_blocked", Some("contract")),
++        Outcome::Rejected => ("dead_letter", Some("payload_rejected")),
++    };
++    let base = 5u64.saturating_mul(1u64 << job.attempts.min(9)).min(1800);
++    let jitter = rand::random::<u32>() as u64 % (base / 2 + 1);
++    let delay = if let Outcome::Retry(Some(delay)) = outcome {
++        (*delay).max(base + jitter)
++    } else {
++        base + jitter
++    };
++    let changed=tx.execute("UPDATE enterprise_deliveries SET state=?4,error=?5,lease=NULL,lease_until=NULL,next_retry_at=?6,ack_at=?7 WHERE event_id=?1 AND destination_id=?2 AND lease=?3 AND state='inflight'",
++        params![job.event_id,job.destination_id,job.lease,state,error,now.saturating_add(delay),if matches!(outcome,Outcome::Accepted){Some(now)}else{None}])?;
++    if changed > 0 {
++        match outcome {
++            Outcome::AuthBlocked | Outcome::TargetBlocked => {
++                tx.execute(
++                    "UPDATE enterprise_targets SET state=?2 WHERE binding=?1",
++                    params![job.binding, state],
++                )?;
++            }
++            Outcome::Retry(Some(_)) => {
++                tx.execute("UPDATE enterprise_targets SET next_request=MAX(next_request,?2) WHERE binding=?1",params![job.binding,now.saturating_add(delay)])?;
++            }
++            Outcome::ProtocolBlocked => {
++                tx.execute("INSERT OR IGNORE INTO enterprise_type_blocks SELECT ?1,kind FROM enterprise_events WHERE event_id=?2",params![job.binding,job.event_id])?;
++                tx.execute("UPDATE enterprise_deliveries SET state='protocol_blocked',error='contract' WHERE binding=?1 AND state='pending' AND event_id IN (SELECT event_id FROM enterprise_events WHERE kind=(SELECT kind FROM enterprise_events WHERE event_id=?2))",params![job.binding,job.event_id])?;
++            }
++            _ => {}
++        }
++    }
++    tx.commit()?;
++    Ok(changed > 0)
++}
++/// Explicit operator retry; no dead-letter/expired data is silently replayed.
++pub fn retry(conn: &Connection) -> Result<usize> {
++    conn.execute(
++        "UPDATE enterprise_targets SET state='ready',next_request=0",
++        [],
++    )?;
++    conn.execute("DELETE FROM enterprise_type_blocks", [])?;
++    let count=conn.execute("UPDATE enterprise_deliveries SET state='pending',next_retry_at=0,error=NULL WHERE state IN ('pending','auth_blocked','target_blocked','protocol_blocked')",[])?;
++    conn.execute(
++        "UPDATE enterprise_inbox SET error=NULL,next_project_at=0 WHERE state='waiting'",
++        [],
++    )?;
++    Ok(count)
++}
++/// Preserve backoff across process restarts; only a genuine configuration or
++/// credential change resumes blocked deliveries automatically.
++pub fn refresh_configuration(conn: &mut Connection, fingerprint: &str) -> Result<()> {
++    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
++    let previous: Option<String> = tx
++        .query_row(
++            "SELECT value FROM enterprise_meta WHERE key='config_fingerprint'",
++            [],
++            |r| r.get(0),
++        )
++        .optional()?;
++    if previous.as_deref().is_some_and(|p| p != fingerprint) {
++        retry(&tx)?;
++    }
++    tx.execute("INSERT INTO enterprise_meta(key,value) VALUES('config_fingerprint',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[fingerprint])?;
++    tx.commit()?;
++    Ok(())
++}
++pub fn expire(conn: &mut Connection, now: u64) -> Result<()> {
++    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
++    let rows = {
++        let mut stmt=tx.prepare("SELECT event_id,kind,state FROM enterprise_inbox WHERE expires_at<=?1 ORDER BY source_id LIMIT 500")?;
++        stmt.query_map([now], |r| {
++            Ok((
++                r.get::<_, String>(0)?,
++                r.get::<_, String>(1)?,
++                r.get::<_, String>(2)?,
++            ))
++        })?
++        .collect::<std::result::Result<Vec<_>, _>>()?
++    };
++    for (id, kind, state) in rows {
++        let pending: u64 = tx.query_row(
++            "SELECT count(*) FROM enterprise_deliveries WHERE event_id=?1 AND state!='delivered'",
++            [&id],
++            |r| r.get(0),
++        )?;
++        if state != "projected" || pending > 0 {
++            loss(&tx, &kind, "expired", now)?;
++        }
++        tx.execute("DELETE FROM enterprise_deliveries WHERE event_id=?1", [&id])?;
++        tx.execute("DELETE FROM enterprise_events WHERE event_id=?1", [&id])?;
++        tx.execute("DELETE FROM enterprise_inbox WHERE event_id=?1", [&id])?;
++    }
++    tx.commit()?;
++    Ok(())
++}
++pub fn status(conn: &Connection, now: u64) -> Result<Value> {
++    let mut inbox=conn.prepare("SELECT kind,state,COALESCE(error,''),COUNT(*),MIN(created_at) FROM enterprise_inbox GROUP BY kind,state,error")?;
++    let inbox=inbox.query_map([],|r|Ok(json!({"event_type":r.get::<_,String>(0)?,"state":r.get::<_,String>(1)?,"reason":r.get::<_,String>(2)?,"count":r.get::<_,u64>(3)?,"oldest_age_seconds":now.saturating_sub(r.get::<_,u64>(4)?)})))?.collect::<std::result::Result<Vec<_>,_>>()?;
++    let mut delivery=conn.prepare("SELECT e.kind,d.destination_id,d.state,COUNT(*),MAX(d.ack_at),MIN(i.created_at) FROM enterprise_deliveries d JOIN enterprise_events e ON e.event_id=d.event_id JOIN enterprise_inbox i ON i.event_id=e.event_id GROUP BY e.kind,d.destination_id,d.state")?;
++    let delivery=delivery.query_map([],|r|Ok(json!({"event_type":r.get::<_,String>(0)?,"destination":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"count":r.get::<_,u64>(3)?,"last_ack_at":r.get::<_,Option<u64>>(4)?,"oldest_age_seconds":now.saturating_sub(r.get::<_,u64>(5)?)})))?.collect::<std::result::Result<Vec<_>,_>>()?;
++    let mut losses =
++        conn.prepare("SELECT kind,reason,count,first_at,last_at FROM enterprise_loss")?;
++    let losses=losses.query_map([],|r|Ok(json!({"event_type":r.get::<_,String>(0)?,"reason":r.get::<_,String>(1)?,"count":r.get::<_,u64>(2)?,"first_at":r.get::<_,u64>(3)?,"last_at":r.get::<_,u64>(4)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
++    let bytes: u64 = conn.query_row("SELECT bytes FROM enterprise_usage WHERE id=1", [], |r| {
++        r.get(0)
++    })?;
++    let mut blocks =
++        conn.prepare("SELECT kind,COUNT(*) FROM enterprise_type_blocks GROUP BY kind")?;
++    let blocks = blocks
++        .query_map([], |r| {
++            Ok(json!({"event_type":r.get::<_,String>(0)?,"blocked_targets":r.get::<_,u64>(1)?}))
++        })?
++        .collect::<std::result::Result<Vec<_>, _>>()?;
++    let mut measurements=conn.prepare("SELECT json_extract(payload,'$.measurement_mode'),COUNT(*),SUM(json_extract(payload,'$.trace_id') IS NOT NULL) FROM enterprise_events WHERE kind='checkpoint' GROUP BY json_extract(payload,'$.measurement_mode')")?;
++    let measurements=measurements.query_map([],|r|Ok(json!({"measurement_mode":r.get::<_,String>(0)?,"events":r.get::<_,u64>(1)?,"with_trace_id":r.get::<_,u64>(2)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
++    Ok(
++        json!({"inbox":inbox,"deliveries":delivery,"losses":losses,"reserved_bytes_used":bytes,"type_blocks":blocks,"checkpoint_measurements":measurements}),
++    )
++}
+diff --git a/src/enterprise_metrics/tests.rs b/src/enterprise_metrics/tests.rs
+new file mode 100644
+index 000000000..67d32ff1f
+--- /dev/null
++++ b/src/enterprise_metrics/tests.rs
+@@ -0,0 +1,775 @@
++use super::*;
++use crate::metrics::PosEncoded;
++use crate::metrics::{CheckpointValues, CommittedValues, EventAttributes, MetricEvent};
++use serde_json::json;
++
++fn config() -> config::Settings {
++    serde_json::from_value(json!({
++        "enabled": true, "organization_id": "org",
++        "identity_secret": "test-only-identity-secret-32-bytes!",
++        "destinations": [{"id":"test", "endpoint":"https://example.test/upload",
++            "token":"test-token", "ack":{"mode":"http_200"},
++            "event_types":["checkpoint","commit"]}]
++    }))
++    .unwrap()
++}
++fn attrs() -> EventAttributes {
++    EventAttributes::new()
++        .repo_url("https://example.test/repo")
++        .author("author@example.test")
++        .session_id("private-session")
++        .commit_sha("abc")
++        .custom_attributes(r#"{"tac_commit_parent_count":"1","tac_enterprise_user_email":"configured@company.test","tac_enterprise_repo_url":"https://company.test/team/project"}"#)
++}
++fn checkpoint(kind: &str) -> MetricEvent {
++    MetricEvent::new(
++        &CheckpointValues::new()
++            .kind(kind)
++            .checkpoint_ts(1700000000)
++            .file_path("private/path.rs")
++            .lines_added(10)
++            .lines_deleted(2),
++        attrs().to_sparse(),
++    )
++}
++#[test]
++fn enterprise_checkpoint_whitelist_and_unknown_kind() {
++    let event = projection::project(&checkpoint("human"), &config(), "stable-id").unwrap();
++    let value = serde_json::to_value(event).unwrap();
++    assert_eq!(value["event_type"], "checkpoint");
++    assert_eq!(value["kind"], "unknown");
++    assert_eq!(value["lines_added"], 10);
++    assert_eq!(value["measurement_mode"], "direct");
++    assert!(value.get("commit_id").is_none());
++    let text = value.to_string();
++    for private in [
++        "private/path",
++        "private-session",
++        "author@example",
++        "example.test/repo",
++    ] {
++        assert!(!text.contains(private));
++    }
++}
++#[test]
++fn enterprise_commit_aggregate_not_double_counted() {
++    let raw = MetricEvent::new(
++        &CommittedValues::new()
++            .commit_ts(1700000000)
++            .human_additions(2)
++            .git_diff_added_lines(15)
++            .git_diff_deleted_lines(3)
++            .tool_model_pairs(vec!["all".into(), "codex::model".into()])
++            .ai_additions(vec![10, 10])
++            .commit_body("PRIVATE BODY")
++            .hunks("PRIVATE DIFF"),
++        attrs().to_sparse(),
++    );
++    let value = serde_json::to_value(projection::project(&raw, &config(), "id").unwrap()).unwrap();
++    assert_eq!(value["ai_additions"], 10);
++    assert_eq!(value["unknown_additions"], 3);
++    assert_eq!(value["tool_model_breakdown"].as_array().unwrap().len(), 1);
++    assert!(!value.to_string().contains("PRIVATE"));
++}
++#[test]
++fn enterprise_recovery_is_not_direct_and_missing_is_not_zero() {
++    let mut raw = checkpoint("ai_agent");
++    raw.values.insert("9".into(), json!("recovered_bash"));
++    let value = serde_json::to_value(projection::project(&raw, &config(), "id").unwrap()).unwrap();
++    assert_eq!(value["measurement_mode"], "recovery");
++    raw.values.remove("3");
++    assert!(projection::project(&raw, &config(), "id").is_err());
++}
++#[test]
++fn enterprise_ack_contract_and_retry_classification() {
++    let ack = config().destinations.remove(0).ack;
++    assert_eq!(
++        sink::classify(200, b"", None, &ack, "id"),
++        sink::Outcome::Accepted
++    );
++    assert_eq!(
++        sink::classify(404, b"", None, &ack, "id"),
++        sink::Outcome::TargetBlocked
++    );
++    assert_eq!(
++        sink::classify(401, b"", None, &ack, "id"),
++        sink::Outcome::AuthBlocked
++    );
++    assert_eq!(
++        sink::classify(429, b"", Some("120"), &ack, "id"),
++        sink::Outcome::Retry(Some(120))
++    );
++    assert_eq!(
++        sink::classify(200, b"", None, &config::Ack::Unconfirmed, "id"),
++        sink::Outcome::ProtocolBlocked
++    );
++    let ack: config::Ack = serde_json::from_value(
++        json!({"mode":"json", "pointer":"/code", "equals":0,"event_id_pointer":"/event_id"}),
++    )
++    .unwrap();
++    assert_eq!(
++        sink::classify(200, br#"{"code":1,"event_id":"id"}"#, None, &ack, "id"),
++        sink::Outcome::ProtocolBlocked
++    );
++    assert_eq!(
++        sink::classify(200, br#"{"code":0,"event_id":"wrong"}"#, None, &ack, "id"),
++        sink::Outcome::ProtocolBlocked
++    );
++}
++
++#[test]
++fn enterprise_outbox_atomic_replay_and_lease_recovery() {
++    let (mut db, _dir) = crate::metrics::db::MetricsDatabase::new_temp_for_tests().unwrap();
++    let cfg = config();
++    let raw = serde_json::to_string(&checkpoint("ai_agent")).unwrap();
++    let ids = db.insert_events(&[raw.clone(), raw]).unwrap();
++    let now = 1700000010;
++    {
++        let tx = db.enterprise_connection().transaction().unwrap();
++        store::capture(&tx, ids[0], 4, 100, &cfg, now).unwrap();
++        // Dropping the transaction also drops the enterprise record.
++    }
++    assert_eq!(
++        store::status(db.enterprise_connection(), now).unwrap()["inbox"],
++        json!([])
++    );
++    {
++        let tx = db.enterprise_connection().transaction().unwrap();
++        for id in &ids {
++            store::capture(&tx, *id, 4, 100, &cfg, now).unwrap();
++        }
++        store::capture(&tx, ids[0], 4, 100, &cfg, now).unwrap();
++        tx.commit().unwrap();
++    }
++    store::project_pending(db.enterprise_connection(), &cfg, now).unwrap();
++    let a = store::claim(
++        db.enterprise_connection(),
++        &cfg.destinations[0],
++        "org",
++        "checkpoint",
++        now,
++    )
++    .unwrap()
++    .unwrap();
++    let b = store::claim(
++        db.enterprise_connection(),
++        &cfg.destinations[0],
++        "org",
++        "checkpoint",
++        now,
++    )
++    .unwrap()
++    .unwrap();
++    assert_ne!(
++        a.event_id, b.event_id,
++        "identical real edits must remain separate"
++    );
++    assert!(
++        store::claim(
++            db.enterprise_connection(),
++            &cfg.destinations[0],
++            "org",
++            "checkpoint",
++            now
++        )
++        .unwrap()
++        .is_none()
++    );
++    let again = store::claim(
++        db.enterprise_connection(),
++        &cfg.destinations[0],
++        "org",
++        "checkpoint",
++        now + 121,
++    )
++    .unwrap()
++    .unwrap();
++    assert_eq!(a.event_id, again.event_id);
++    assert!(
++        !store::finish(
++            db.enterprise_connection(),
++            &a,
++            &sink::Outcome::Accepted,
++            now + 121
++        )
++        .unwrap()
++    );
++    assert!(
++        store::finish(
++            db.enterprise_connection(),
++            &again,
++            &sink::Outcome::Accepted,
++            now + 121
++        )
++        .unwrap()
++    );
++}
++#[test]
++fn enterprise_original_scope_blocks_retargeting() {
++    let (mut db, _dir) = crate::metrics::db::MetricsDatabase::new_temp_for_tests().unwrap();
++    let cfg = config();
++    let ids = db
++        .insert_events(&[serde_json::to_string(&checkpoint("ai_agent")).unwrap()])
++        .unwrap();
++    let tx = db.enterprise_connection().transaction().unwrap();
++    store::capture(&tx, ids[0], 4, 100, &cfg, 100).unwrap();
++    tx.commit().unwrap();
++    let mut other = cfg.clone();
++    other.organization_id = "other-org".into();
++    store::project_pending(db.enterprise_connection(), &other, 100).unwrap();
++    assert!(
++        store::claim(
++            db.enterprise_connection(),
++            &other.destinations[0],
++            "other-org",
++            "checkpoint",
++            100
++        )
++        .unwrap()
++        .is_none()
++    );
++    store::project_pending(db.enterprise_connection(), &cfg, 100).unwrap();
++    other = cfg.clone();
++    other.destinations[0].endpoint = "https://elsewhere.test/upload".into();
++    assert!(
++        store::claim(
++            db.enterprise_connection(),
++            &other.destinations[0],
++            "org",
++            "checkpoint",
++            100
++        )
++        .unwrap()
++        .is_none()
++    );
++}
++
++#[test]
++fn enterprise_identity_is_frozen_before_upload() {
++    let (mut db, _dir) = crate::metrics::db::MetricsDatabase::new_temp_for_tests().unwrap();
++    let cfg = config();
++    let ids = db
++        .insert_events(&[serde_json::to_string(&checkpoint("ai_agent")).unwrap()])
++        .unwrap();
++    let tx = db.enterprise_connection().transaction().unwrap();
++    store::capture(&tx, ids[0], 4, 100, &cfg, 100).unwrap();
++    tx.commit().unwrap();
++    let mut changed = cfg.clone();
++    changed.client_version = "new-version".into();
++    store::project_pending(db.enterprise_connection(), &changed, 100).unwrap();
++    let job = store::claim(
++        db.enterprise_connection(),
++        &cfg.destinations[0],
++        "org",
++        "checkpoint",
++        100,
++    )
++    .unwrap()
++    .unwrap();
++    assert_eq!(
++        serde_json::from_str::<serde_json::Value>(&job.payload).unwrap()["user_id"],
++        "configured@company.test"
++    );
++}
++#[test]
++fn enterprise_protocol_block_applies_to_new_rows_of_same_type() {
++    let (mut db, _dir) = crate::metrics::db::MetricsDatabase::new_temp_for_tests().unwrap();
++    let cfg = config();
++    for time in [100, 101] {
++        let ids = db
++            .insert_events(&[serde_json::to_string(&checkpoint("ai_agent")).unwrap()])
++            .unwrap();
++        let tx = db.enterprise_connection().transaction().unwrap();
++        store::capture(&tx, ids[0], 4, 100, &cfg, time).unwrap();
++        tx.commit().unwrap();
++        store::project_pending(db.enterprise_connection(), &cfg, time).unwrap();
++        let job = store::claim(
++            db.enterprise_connection(),
++            &cfg.destinations[0],
++            "org",
++            "checkpoint",
++            time,
++        )
++        .unwrap();
++        if time == 100 {
++            store::finish(
++                db.enterprise_connection(),
++                &job.unwrap(),
++                &sink::Outcome::ProtocolBlocked,
++                time,
++            )
++            .unwrap();
++        } else {
++            assert!(
++                job.is_none(),
++                "a new row must not bypass a type-level contract block"
++            );
++        }
++    }
++}
++
++#[test]
++fn enterprise_http_adapter_wraps_one_event_and_never_follows_redirects() {
++    use sink::EventSink;
++    let mut server = mockito::Server::new();
++    let mut dest = config().destinations.remove(0);
++    dest.endpoint = format!("{}/upload", server.url());
++    dest.token = "test-token".into();
++    let payload = serde_json::to_string(
++        &projection::project(&checkpoint("ai_agent"), &config(), "stable-id").unwrap(),
++    )
++    .unwrap();
++    let accepted = server
++        .mock("POST", "/upload")
++        .match_header("token", "test-token")
++        .match_header("content-type", "application/json")
++        .match_body(mockito::Matcher::PartialJson(
++            json!({"completeData":{"event_id":"stable-id","event_type":"checkpoint"}}),
++        ))
++        .with_status(200)
++        .expect(1)
++        .create();
++    assert_eq!(
++        sink::AutoPaiSink { destination: &dest }.deliver(&payload, "stable-id"),
++        sink::Outcome::Accepted
++    );
++    accepted.assert();
++    accepted.remove();
++    let forbidden = server.mock("POST", "/redirected").expect(0).create();
++    let redirect = server
++        .mock("POST", "/upload")
++        .with_status(307)
++        .with_header("location", &format!("{}/redirected", server.url()))
++        .create();
++    assert_eq!(
++        sink::AutoPaiSink { destination: &dest }.deliver(&payload, "stable-id"),
++        sink::Outcome::TargetBlocked
++    );
++    redirect.assert();
++    forbidden.assert();
++}
++#[test]
++fn enterprise_capacity_reserves_commit_and_expiry_releases_inbox() {
++    let (mut db, _dir) = crate::metrics::db::MetricsDatabase::new_temp_for_tests().unwrap();
++    let mut cfg = config();
++    cfg.max_bytes = 10000;
++    cfg.commit_reserved_bytes = 5000;
++    cfg.retention_secs = 60;
++    let raw = serde_json::to_string(&checkpoint("ai_agent")).unwrap();
++    let ids = db.insert_events(&[raw.clone(), raw.clone(), raw]).unwrap();
++    let tx = db.enterprise_connection().transaction().unwrap();
++    store::capture(&tx, ids[0], 4, 100, &cfg, 100).unwrap();
++    store::capture(&tx, ids[1], 4, 100, &cfg, 100).unwrap();
++    store::capture(&tx, ids[2], 1, 100, &cfg, 100).unwrap();
++    tx.commit().unwrap();
++    let status = store::status(db.enterprise_connection(), 100).unwrap();
++    assert_eq!(status["losses"][0]["event_type"], "checkpoint");
++    assert_eq!(status["losses"][0]["reason"], "capacity");
++    let n: u64 = db
++        .enterprise_connection()
++        .query_row("SELECT COUNT(*) FROM enterprise_inbox", [], |r| r.get(0))
++        .unwrap();
++    assert_eq!(n, 2);
++    store::expire(db.enterprise_connection(), 161).unwrap();
++    let n: u64 = db
++        .enterprise_connection()
++        .query_row("SELECT COUNT(*) FROM enterprise_inbox", [], |r| r.get(0))
++        .unwrap();
++    assert_eq!(n, 0);
++}
++#[test]
++fn enterprise_config_rejects_unsafe_endpoint_and_empty_ids() {
++    let mut cfg = config();
++    assert!(cfg.validate().is_ok());
++    cfg.destinations[0].endpoint = "http://example.test/upload".into();
++    assert!(cfg.validate().is_err());
++    cfg = config();
++    cfg.organization_id.clear();
++    assert!(cfg.validate().is_err());
++}
++
++#[test]
++fn enterprise_restart_preserves_retry_after_until_config_changes() {
++    let (mut db, _dir) = crate::metrics::db::MetricsDatabase::new_temp_for_tests().unwrap();
++    let cfg = config();
++    store::refresh_configuration(db.enterprise_connection(), "config-a").unwrap();
++    let ids = db
++        .insert_events(&[serde_json::to_string(&checkpoint("ai_agent")).unwrap()])
++        .unwrap();
++    let tx = db.enterprise_connection().transaction().unwrap();
++    store::capture(&tx, ids[0], 4, 100, &cfg, 100).unwrap();
++    tx.commit().unwrap();
++    store::project_pending(db.enterprise_connection(), &cfg, 100).unwrap();
++    let job = store::claim(
++        db.enterprise_connection(),
++        &cfg.destinations[0],
++        "org",
++        "checkpoint",
++        100,
++    )
++    .unwrap()
++    .unwrap();
++    store::finish(
++        db.enterprise_connection(),
++        &job,
++        &sink::Outcome::Retry(Some(1000)),
++        100,
++    )
++    .unwrap();
++    store::refresh_configuration(db.enterprise_connection(), "config-a").unwrap();
++    assert!(
++        store::claim(
++            db.enterprise_connection(),
++            &cfg.destinations[0],
++            "org",
++            "checkpoint",
++            101
++        )
++        .unwrap()
++        .is_none()
++    );
++    store::refresh_configuration(db.enterprise_connection(), "config-b").unwrap();
++    assert!(
++        store::claim(
++            db.enterprise_connection(),
++            &cfg.destinations[0],
++            "org",
++            "checkpoint",
++            101
++        )
++        .unwrap()
++        .is_some()
++    );
++}
++
++#[test]
++fn enterprise_commit_requires_observed_parent_count() {
++    let values = CommittedValues::new()
++        .commit_ts(1700000000)
++        .human_additions(2)
++        .git_diff_added_lines(2)
++        .git_diff_deleted_lines(0)
++        .tool_model_pairs(vec!["all".into()])
++        .ai_additions(vec![0]);
++    let raw = MetricEvent::new(
++        &values,
++        EventAttributes::new()
++            .repo_url("https://example.test/repo")
++            .author("author@example.test")
++            .commit_sha("abc")
++            .to_sparse(),
++    );
++    assert!(projection::project(&raw, &config(), "id").is_err());
++}
++
++#[test]
++fn enterprise_pruning_cannot_delete_unprojected_source() {
++    let (mut db, _dir) = crate::metrics::db::MetricsDatabase::new_temp_for_tests().unwrap();
++    let cfg = config();
++    let ids = db
++        .insert_events(&[serde_json::to_string(&checkpoint("ai_agent")).unwrap()])
++        .unwrap();
++    let tx = db.enterprise_connection().transaction().unwrap();
++    store::capture(&tx, ids[0], 4, 100, &cfg, now()).unwrap();
++    tx.commit().unwrap();
++    db.enterprise_connection()
++        .execute("UPDATE metrics SET event_ts=1 WHERE id=?1", [ids[0]])
++        .unwrap();
++    db.enterprise_connection()
++        .execute(
++            "DELETE FROM schema_metadata WHERE key='metrics_last_prune_ts'",
++            [],
++        )
++        .unwrap();
++    db.mark_records_delivered(&ids, now()).unwrap();
++    let count: u64 = db
++        .enterprise_connection()
++        .query_row("SELECT COUNT(*) FROM metrics WHERE id=?1", [ids[0]], |r| {
++            r.get(0)
++        })
++        .unwrap();
++    assert_eq!(count, 1);
++    store::project_pending(db.enterprise_connection(), &cfg, now()).unwrap();
++    db.enterprise_connection()
++        .execute(
++            "DELETE FROM schema_metadata WHERE key='metrics_last_prune_ts'",
++            [],
++        )
++        .unwrap();
++    db.mark_records_delivered(&ids, now()).unwrap();
++    let count: u64 = db
++        .enterprise_connection()
++        .query_row("SELECT COUNT(*) FROM metrics WHERE id=?1", [ids[0]], |r| {
++            r.get(0)
++        })
++        .unwrap();
++    assert_eq!(count, 0);
++    assert!(
++        store::claim(
++            db.enterprise_connection(),
++            &cfg.destinations[0],
++            "org",
++            "checkpoint",
++            now()
++        )
++        .unwrap()
++        .is_some()
++    );
++}
++#[test]
++fn enterprise_destinations_ack_independently_and_disabled_capture_is_empty() {
++    let (mut db, _dir) = crate::metrics::db::MetricsDatabase::new_temp_for_tests().unwrap();
++    let mut cfg = config();
++    let mut second = cfg.destinations[0].clone();
++    second.id = "second".into();
++    cfg.destinations.push(second);
++    let ids = db
++        .insert_events(&[serde_json::to_string(&checkpoint("ai_agent")).unwrap()])
++        .unwrap();
++    let mut off = cfg.clone();
++    off.enabled = false;
++    let tx = db.enterprise_connection().transaction().unwrap();
++    store::capture(&tx, ids[0], 4, 100, &off, 100).unwrap();
++    tx.commit().unwrap();
++    assert_eq!(
++        store::status(db.enterprise_connection(), 100).unwrap()["inbox"],
++        json!([])
++    );
++    let tx = db.enterprise_connection().transaction().unwrap();
++    store::capture(&tx, ids[0], 4, 100, &cfg, 100).unwrap();
++    tx.commit().unwrap();
++    store::project_pending(db.enterprise_connection(), &cfg, 100).unwrap();
++    let first = store::claim(
++        db.enterprise_connection(),
++        &cfg.destinations[0],
++        "org",
++        "checkpoint",
++        100,
++    )
++    .unwrap()
++    .unwrap();
++    store::finish(
++        db.enterprise_connection(),
++        &first,
++        &sink::Outcome::Accepted,
++        100,
++    )
++    .unwrap();
++    let second = store::claim(
++        db.enterprise_connection(),
++        &cfg.destinations[1],
++        "org",
++        "checkpoint",
++        100,
++    )
++    .unwrap()
++    .unwrap();
++    assert_eq!(first.event_id, second.event_id);
++}
++
++#[test]
++fn enterprise_zero_config_identity_uses_snapshot_not_author_or_maps() {
++    let mut raw = checkpoint("ai_agent");
++    raw.attrs = attrs().custom_attributes(r#"{"tac_enterprise_user_email":"configured@company.test","tac_enterprise_repo_url":"https://company.test/team/project","tac_commit_parent_count":"1"}"#).to_sparse();
++    let event = projection::project(&raw, &config(), "stable-id").unwrap();
++    assert_eq!(event.user_id, "configured@company.test");
++    assert_eq!(event.repo_id, "https://company.test/team/project");
++}
++
++#[test]
++fn enterprise_zero_config_commit_keeps_git_sha() {
++    let raw = MetricEvent::new(
++        &CommittedValues::new()
++            .commit_ts(1700000000)
++            .human_additions(0)
++            .git_diff_added_lines(0)
++            .git_diff_deleted_lines(0)
++            .tool_model_pairs(vec!["all".into()])
++            .ai_additions(vec![0]),
++        attrs()
++            .commit_sha("0123456789abcdef0123456789abcdef01234567")
++            .to_sparse(),
++    );
++    let value = serde_json::to_value(projection::project(&raw, &config(), "id").unwrap()).unwrap();
++    assert_eq!(
++        value["commit_id"],
++        "0123456789abcdef0123456789abcdef01234567"
++    );
++}
++
++#[test]
++fn enterprise_zero_config_does_not_guess_missing_snapshot_from_author() {
++    let raw = MetricEvent::new(
++        &CheckpointValues::new()
++            .kind("ai_agent")
++            .lines_added(1)
++            .lines_deleted(0),
++        EventAttributes::new()
++            .author("author@example.test")
++            .repo_url("https://example.test/repo")
++            .to_sparse(),
++    );
++    assert!(matches!(
++        projection::project(&raw, &config(), "id"),
++        Err(projection::ProjectionError::WaitingIdentity)
++    ));
++}
++
++#[test]
++fn enterprise_zero_config_accepts_embedded_publisher_token_without_maps() {
++    let cfg: config::Settings = serde_json::from_value(json!({
++        "enabled":true,"organization_id":"org","identity_secret":"test-stable-secret-at-least-32-bytes",
++        "destinations":[{"id":"company","endpoint":"https://company.test/upload","token":"fixture-token",
++            "ack":{"mode":"unconfirmed"},"event_types":["checkpoint","commit"]}]
++    })).unwrap();
++    assert!(cfg.validate().is_ok());
++    assert_eq!(
++        cfg.destinations[0].token().as_deref(),
++        Some("fixture-token")
++    );
++    assert!(!cfg.client_version.is_empty());
++    assert!(
++        !serde_json::to_string(&cfg.destinations)
++            .unwrap()
++            .contains("fixture-token")
++    );
++}
++
++#[test]
++fn enterprise_zero_config_captures_each_repo_and_freezes_identity() {
++    use crate::git::repository::discover_repository_in_path_no_git_exec;
++    fn repository(
++        email: &str,
++        remote: &str,
++    ) -> (tempfile::TempDir, crate::git::repository::Repository) {
++        let dir = tempfile::tempdir().unwrap();
++        let status = std::process::Command::new(crate::config::Config::get().git_cmd())
++            .args(["init", "--quiet"])
++            .arg(dir.path())
++            .env_remove("GIT_TRACE2_EVENT")
++            .status()
++            .unwrap();
++        assert!(status.success());
++        std::fs::write(dir.path().join(".git/config"), format!("[core]\nrepositoryformatversion = 0\nbare = false\n[user]\nemail = {email}\n[remote \"origin\"]\nurl = {remote}\n")).unwrap();
++        let repo = discover_repository_in_path_no_git_exec(dir.path()).unwrap();
++        (dir, repo)
++    }
++    let (first_dir, first) = repository("one@company.test", "git@company.test:team/one.git");
++    let (_second_dir, second) = repository(
++        "two@company.test",
++        "https://token@company.test/team/two.git",
++    );
++    let first_attrs = identity::capture(&first, attrs());
++    let second_attrs = identity::capture(&second, attrs());
++    assert_eq!(
++        identity::from_attrs(&first_attrs),
++        (
++            Some("one@company.test".into()),
++            Some("https://company.test/team/one".into())
++        )
++    );
++    assert_eq!(
++        identity::from_attrs(&second_attrs),
++        (
++            Some("two@company.test".into()),
++            Some("https://company.test/team/two".into())
++        )
++    );
++    assert_eq!(
++        first_attrs.author,
++        attrs().author,
++        "upstream author is preserved"
++    );
++    std::fs::write(first_dir.path().join(".git/config"), "[user]\nemail = changed@company.test\n[remote \"other\"]\nurl = https://company.test/team/changed.git\n").unwrap();
++    assert_eq!(
++        identity::from_attrs(&first_attrs).0.as_deref(),
++        Some("one@company.test")
++    );
++    let updated = identity::capture(&first, attrs());
++    assert_eq!(
++        identity::from_attrs(&updated),
++        (
++            Some("changed@company.test".into()),
++            Some("https://company.test/team/changed".into())
++        )
++    );
++    std::fs::write(first_dir.path().join(".git/config"), "[remote \"origin\"]\npushurl = https://company.test/origin.git\n[remote \"backup\"]\nurl = https://company.test/backup.git\n").unwrap();
++    assert_eq!(
++        identity::from_attrs(&identity::capture(&first, attrs())).1,
++        None
++    );
++    std::fs::write(
++        first_dir.path().join(".git/HEAD"),
++        "ref: refs/heads/enterprise\n",
++    )
++    .unwrap();
++    std::fs::write(
++        first_dir.path().join(".git/branch-user"),
++        "[user]\nemail = branch@company.test\n",
++    )
++    .unwrap();
++    std::fs::write(first_dir.path().join(".git/config"), "[user]\nemail = fallback@company.test\n[includeIf \"onbranch:enterprise\"]\npath = branch-user\n").unwrap();
++    assert_eq!(
++        identity::from_attrs(&identity::capture(&first, attrs()))
++            .0
++            .as_deref(),
++        Some("branch@company.test")
++    );
++    std::fs::write(first_dir.path().join(".git/config"), "[user]\nemail = \n[remote \"a\"]\nurl = https://company.test/a.git\n[remote \"b\"]\nurl = https://company.test/b.git\n").unwrap();
++    assert_eq!(
++        identity::from_attrs(&identity::capture(&first, attrs())),
++        (None, None)
++    );
++}
++
++#[test]
++fn enterprise_zero_config_defaults_disabled_and_rejects_invalid_publisher_data() {
++    assert!(config::parse(br#"{"enabled":false}"#).unwrap().is_none());
++    assert!(config::parse(br#"{"enabled":true}"#).is_err());
++    assert!(config::parse(br#"{"enabled":"false"}"#).is_err());
++    assert!(
++        config::parse(super::embedded::CONFIG.as_bytes())
++            .unwrap()
++            .is_none()
++    );
++    let cfg = config();
++    assert_ne!(
++        cfg.identity_binding(),
++        config::digest(&cfg.identity_secret),
++        "old mapping scope must not be reinterpreted"
++    );
++}
++
++#[test]
++fn enterprise_zero_config_distinct_remote_ports_do_not_collide() {
++    let source = |url: &str| {
++        attrs().custom_attributes(
++            json!({"tac_enterprise_user_email":"u@company.test","tac_enterprise_repo_url":url})
++                .to_string(),
++        )
++    };
++    assert_eq!(
++        identity::from_attrs(&source("ssh://git@git.company.test:22/team/repo.git"))
++            .1
++            .as_deref(),
++        Some("https://git.company.test/team/repo")
++    );
++    assert_eq!(
++        identity::from_attrs(&source("https://git.company.test:8443/team/repo.git"))
++            .1
++            .as_deref(),
++        Some("https://git.company.test:8443/team/repo")
++    );
++    assert_eq!(
++        identity::from_attrs(&source("https://git.company.test:9443/team/repo.git"))
++            .1
++            .as_deref(),
++        Some("https://git.company.test:9443/team/repo")
++    );
++    assert_eq!(
++        identity::from_attrs(&source("alias.company.test:team/repo.git"))
++            .1
++            .as_deref(),
++        Some("https://alias.company.test/team/repo")
++    );
++}
+diff --git a/src/enterprise_metrics/transport.rs b/src/enterprise_metrics/transport.rs
+new file mode 100644
+index 000000000..42925685a
+--- /dev/null
++++ b/src/enterprise_metrics/transport.rs
+@@ -0,0 +1,62 @@
++//! Reusable HTTP mechanics; no event types, vendor envelope or ACK policy.
++use std::{sync::OnceLock, time::Duration};
++pub struct Response {
++    pub status: u16,
++    pub retry_after: Option<String>,
++    pub body: Option<Vec<u8>>,
++}
++pub struct TransportError;
++pub trait HttpTransport {
++    fn post_json(
++        &self,
++        endpoint: &str,
++        auth_header: &str,
++        token: &str,
++        body: &str,
++    ) -> Result<Response, TransportError>;
++}
++pub struct UreqTransport;
++impl HttpTransport for UreqTransport {
++    fn post_json(
++        &self,
++        endpoint: &str,
++        auth_header: &str,
++        token: &str,
++        body: &str,
++    ) -> Result<Response, TransportError> {
++        static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
++        let agent = AGENT.get_or_init(|| {
++            ureq::Agent::config_builder()
++                .http_status_as_error(false)
++                .max_redirects(0)
++                .max_redirects_will_error(false)
++                .timeout_connect(Some(Duration::from_secs(3)))
++                .timeout_global(Some(Duration::from_secs(10)))
++                .build()
++                .into()
++        });
++        let mut response = agent
++            .post(endpoint)
++            .header("Content-Type", "application/json")
++            .header(auth_header, token)
++            .send(body.as_bytes())
++            .map_err(|_| TransportError)?;
++        let status = response.status().as_u16();
++        let retry_after = response
++            .headers()
++            .get("Retry-After")
++            .and_then(|h| h.to_str().ok())
++            .map(str::to_owned);
++        let body = response
++            .body_mut()
++            .with_config()
++            .limit(64 * 1024)
++            .read_to_vec()
++            .ok();
++        Ok(Response {
++            status,
++            retry_after,
++            body,
++        })
++    }
++}
+diff --git a/src/enterprise_metrics/worker.rs b/src/enterprise_metrics/worker.rs
+new file mode 100644
+index 000000000..6b95e7130
+--- /dev/null
++++ b/src/enterprise_metrics/worker.rs
+@@ -0,0 +1,166 @@
++use super::{
++    config, now,
++    sink::{Outcome, for_destination},
++    store,
++};
++use crate::metrics::db::MetricsDatabase;
++use serde_json::{Value, json};
++use std::collections::HashMap;
++use std::sync::{
++    OnceLock,
++    atomic::{AtomicBool, Ordering},
++};
++use std::time::{Duration, Instant};
++static STARTED: AtomicBool = AtomicBool::new(false);
++static RETRY: AtomicBool = AtomicBool::new(false);
++static WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
++static WORKER_ERROR: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
++fn notify() -> &'static tokio::sync::Notify {
++    WAKE.get_or_init(tokio::sync::Notify::new)
++}
++#[derive(Default)]
++struct State {
++    slots: HashMap<String, usize>,
++    destination: usize,
++    last_request: HashMap<String, Instant>,
++}
++/// All disk and HTTP work runs on the dedicated telemetry blocking pool.
++pub fn spawn() {
++    if STARTED.swap(true, Ordering::SeqCst) {
++        return;
++    }
++    config::reload();
++    crate::tokio_runtime::telemetry_runtime().spawn(async {
++        let mut state=State::default();
++        loop {
++            state=tokio::task::spawn_blocking(move || {
++                let result=tick(&mut state);
++                *WORKER_ERROR.lock().expect("worker error lock")=result.err().map(|_|"enterprise_worker_failed");
++                state
++            }).await.unwrap_or_default();
++            tokio::select! { _=tokio::time::sleep(Duration::from_secs(3))=>{}, _=notify().notified()=>{} }
++        }
++    });
++}
++fn with_db<T>(f: impl FnOnce(&mut rusqlite::Connection) -> store::Result<T>) -> store::Result<T> {
++    let mut db = MetricsDatabase::global()?
++        .lock()
++        .map_err(|_| crate::error::GitAiError::Generic("metrics database lock poisoned".into()))?;
++    f(db.enterprise_connection())
++}
++fn tick(state: &mut State) -> store::Result<()> {
++    config::reload();
++    // Retention remains active even if collection/upload is disabled.
++    with_db(|conn| store::expire(conn, now()))?;
++    let Some(cfg) = config::current() else {
++        return Ok(());
++    };
++    let credential_fingerprints: Vec<_> = cfg
++        .destinations
++        .iter()
++        .map(|d| (d.binding(), d.token().map(|v| config::digest(&v))))
++        .collect();
++    let fingerprint = config::digest(&serde_json::to_string(&(
++        cfg.as_ref(),
++        credential_fingerprints,
++    ))?);
++    with_db(|conn| store::refresh_configuration(conn, &fingerprint))?;
++    if RETRY.swap(false, Ordering::SeqCst) {
++        with_db(|conn| {
++            let tx = conn.transaction()?;
++            store::retry(&tx)?;
++            tx.commit()?;
++            Ok(())
++        })?;
++    }
++    with_db(|conn| store::project_pending(conn, &cfg, now()))?;
++    // Two requests at a time, four per tick. Network waits never hold the DB lock.
++    for _ in 0..2 {
++        std::thread::scope(|scope| -> store::Result<()> {
++            let mut uploads = Vec::new();
++            for _ in 0..2 {
++                let dest = &cfg.destinations[state.destination % cfg.destinations.len()];
++                state.destination = state.destination.wrapping_add(1);
++                let slot = state.slots.entry(dest.binding()).or_default();
++                let preferred = if (*slot).is_multiple_of(4) {
++                    "commit"
++                } else {
++                    "checkpoint"
++                };
++                *slot = slot.wrapping_add(1);
++                let alternate = if preferred == "commit" {
++                    "checkpoint"
++                } else {
++                    "commit"
++                };
++                let mut job = None;
++                for kind in [preferred, alternate] {
++                    job = with_db(|conn| {
++                        store::claim(conn, dest, &cfg.organization_id, kind, now())
++                    })?;
++                    if job.is_some() {
++                        break;
++                    }
++                }
++                let Some(job) = job else { continue };
++                let value: Value = serde_json::from_str(&job.payload)?;
++                let supported = dest
++                    .event_types
++                    .iter()
++                    .any(|t| Some(t.as_str()) == value["event_type"].as_str());
++                if !supported || matches!(dest.ack, config::Ack::Unconfirmed) {
++                    with_db(|conn| store::finish(conn, &job, &Outcome::ProtocolBlocked, now()))?;
++                    continue;
++                }
++                let interval = Duration::from_millis(dest.min_interval_ms);
++                if let Some(last) = state.last_request.get(&job.binding)
++                    && let Some(wait) = interval.checked_sub(last.elapsed())
++                {
++                    std::thread::sleep(wait);
++                }
++                state
++                    .last_request
++                    .insert(job.binding.clone(), Instant::now());
++                uploads.push(scope.spawn(move || {
++                    let outcome = for_destination(dest).deliver(&job.payload, &job.event_id);
++                    with_db(|conn| store::finish(conn, &job, &outcome, now())).map(|_| ())
++                }));
++            }
++            for upload in uploads {
++                upload.join().map_err(|_| {
++                    crate::error::GitAiError::Generic("enterprise upload task failed".into())
++                })??;
++            }
++            Ok(())
++        })?;
++    }
++    Ok(())
++}
++/// Run on a blocking pool from the daemon control API; commands never open an
++/// independent uploader or alter the original event identity.
++pub fn control(action: &str) -> store::Result<Value> {
++    match action {
++        "status" => {}
++        "flush" => {
++            notify().notify_one();
++        }
++        "retry" => {
++            RETRY.store(true, Ordering::SeqCst);
++            notify().notify_one();
++        }
++        _ => {
++            return Err(crate::error::GitAiError::Generic(
++                "expected telemetry status, flush or retry".into(),
++            ));
++        }
++    }
++    let mut value = with_db(|conn| store::status(conn, now()))?;
++    value["enabled"] = json!(config::current().is_some());
++    value["config_error"] = json!(config::last_error());
++    value["worker_error"] = json!(*WORKER_ERROR.lock().expect("worker error lock"));
++    value["upstream_metric_batches_dropped"] =
++        json!(crate::daemon::telemetry_worker::metric_batches_dropped());
++    value["requested_action"] = json!(action);
++    value["flush_is_async"] = json!(true);
++    Ok(value)
++}
+diff --git a/src/git/repository.rs b/src/git/repository.rs
+index 81c52da52..bbe1b7ffa 100644
+--- a/src/git/repository.rs
++++ b/src/git/repository.rs
+@@ -1313,6 +1313,13 @@ impl Repository {
+         git_config_file_for_repo_paths(self.path(), self.common_dir())
+     }
+ 
++    /// Enterprise metric snapshots resolve branch-conditional includes outside ingestion.
++    pub(crate) fn enterprise_config_snapshot(
++        &self,
++    ) -> Result<gix_config::File<'static>, GitAiError> {
++        git_config_file_for_repo_paths_with_branch(self.path(), self.common_dir(), true)
++    }
++
+     /// Get config value for a given key as a String.
+     pub fn config_get_str(&self, key: &str) -> Result<Option<String>, GitAiError> {
+         self.get_git_config_file()
+@@ -2268,6 +2275,23 @@ fn git_config_file_for_repo_paths(
+     git_dir: &Path,
+     git_common_dir: &Path,
+ ) -> Result<gix_config::File<'static>, GitAiError> {
++    git_config_file_for_repo_paths_with_branch(git_dir, git_common_dir, false)
++}
++
++fn git_config_file_for_repo_paths_with_branch(
++    git_dir: &Path,
++    git_common_dir: &Path,
++    resolve_branch_includes: bool,
++) -> Result<gix_config::File<'static>, GitAiError> {
++    let head = if resolve_branch_includes {
++        std::fs::read_to_string(git_dir.join("HEAD")).ok()
++    } else {
++        None
++    };
++    let branch_name = head
++        .as_deref()
++        .and_then(|head| head.trim().strip_prefix("ref: "))
++        .and_then(|name| name.try_into().ok());
+     let mut config =
+         gix_config::File::from_globals().map_err(|e| GitAiError::GixError(e.to_string()))?;
+ 
+@@ -2280,7 +2304,7 @@ fn git_config_file_for_repo_paths(
+             },
+             gix_config::file::includes::conditional::Context {
+                 git_dir: Some(git_dir),
+-                branch_name: None,
++                branch_name,
+             },
+         ),
+         ..Default::default()
+diff --git a/src/lib.rs b/src/lib.rs
+index c04673a15..5d4b95023 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,6 +8,7 @@ pub mod config;
+ pub mod daemon;
+ pub mod diagnostic_sentinels;
+ pub mod diagnostics;
++pub mod enterprise_metrics;
+ pub mod error;
+ pub mod feature_flags;
+ pub mod git;
+diff --git a/src/metrics/db.rs b/src/metrics/db.rs
+index 21d465060..f70035c36 100644
+--- a/src/metrics/db.rs
++++ b/src/metrics/db.rs
+@@ -286,6 +286,7 @@ impl MetricsDatabase {
+ 
+     /// Initialize schema and handle migrations
+     fn initialize_schema(&mut self) -> Result<(), GitAiError> {
++        crate::enterprise_metrics::store::initialize(&self.conn)?;
+         // FAST PATH: Check if database is already at current version
+         let version_check: Result<usize, _> = self.conn.query_row(
+             "SELECT value FROM schema_metadata WHERE key = 'version'",
+@@ -495,6 +496,10 @@ impl MetricsDatabase {
+         Ok(count > 0)
+     }
+ 
++    pub(crate) fn enterprise_connection(&mut self) -> &mut Connection {
++        &mut self.conn
++    }
++
+     /// Insert undelivered events as JSON strings.
+     pub fn insert_events(&mut self, events: &[String]) -> Result<Vec<i64>, GitAiError> {
+         self.insert_events_with_delivered_ts(events, None)
+@@ -568,7 +573,18 @@ impl MetricsDatabase {
+                         .as_ref()
+                         .and_then(|m| m.external_tool_use_id.as_deref()),
+                 ])?;
+-                ids.push(tx.last_insert_rowid());
++                let source_id = tx.last_insert_rowid();
++                if let Some(cfg) = crate::enterprise_metrics::config::current() {
++                    crate::enterprise_metrics::store::capture(
++                        &tx,
++                        source_id,
++                        metadata.as_ref().map_or(0, |m| m.event_kind),
++                        event_json.len(),
++                        &cfg,
++                        current_unix_ts(),
++                    )?;
++                }
++                ids.push(source_id);
+             }
+         }
+ 
+@@ -936,7 +952,7 @@ impl MetricsDatabase {
+             params![now.to_string()],
+         )?;
+         {
+-            let mut stmt = tx.prepare_cached("DELETE FROM metrics WHERE id = ?1")?;
++            let mut stmt = tx.prepare_cached("DELETE FROM metrics WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM enterprise_inbox WHERE source_id=metrics.id AND state='waiting')")?;
+             for id in rows_to_prune {
+                 stmt.execute(params![id])?;
+             }
+diff --git a/tests/integration/bash_attribution.rs b/tests/integration/bash_attribution.rs
+index 7c0da783a..9113579b2 100644
+--- a/tests/integration/bash_attribution.rs
++++ b/tests/integration/bash_attribution.rs
+@@ -1017,6 +1017,15 @@ fn test_edge_extension_recovery_metric_copies_source_session_tool_and_model() {
+     let (_metrics_db_dir, metrics_db_path) = isolated_metrics_db_path();
+     let repo =
+         TestRepo::new_with_daemon_env(&[("GIT_AI_TEST_METRICS_DB_PATH", metrics_db_path.as_str())]);
++    repo.git(&["config", "user.email", "recovery@company.test"])
++        .unwrap();
++    repo.git(&[
++        "remote",
++        "add",
++        "origin",
++        "git@company.test:team/recovery.git",
++    ])
++    .unwrap();
+     let repo_root = repo.canonical_path();
+     let file_path = repo.path().join("edge.txt");
+     let transcript_path = repo_root.join("session.jsonl");
+@@ -1061,6 +1070,14 @@ fn test_edge_extension_recovery_metric_copies_source_session_tool_and_model() {
+     ]);
+ 
+     let event = wait_for_edge_recovery_metric(&metrics_db_path);
++    let extra: serde_json::Value =
++        serde_json::from_str(sparse_str(&event.attrs, attr_pos::CUSTOM_ATTRIBUTES).unwrap_or("{}"))
++            .unwrap();
++    assert_eq!(extra["tac_enterprise_user_email"], "recovery@company.test");
++    assert_eq!(
++        extra["tac_enterprise_repo_url"],
++        "https://company.test/team/recovery"
++    );
+     assert_eq!(
+         sparse_str(&event.attrs, attr_pos::TOOL),
+         Some("claude"),
+diff --git a/tests/integration/enterprise_metrics.rs b/tests/integration/enterprise_metrics.rs
+new file mode 100644
+index 000000000..061c032ce
+--- /dev/null
++++ b/tests/integration/enterprise_metrics.rs
+@@ -0,0 +1,123 @@
++use crate::repos::test_file::ExpectedLineExt;
++use crate::repos::test_repo::TestRepo;
++use crate::test_utils::isolated_metrics_db_path;
++use serde_json::{Value, json};
++use std::{
++    fs,
++    time::{Duration, Instant},
++};
++
++#[test]
++fn enterprise_metrics_captures_real_checkpoint_and_commit_without_network() {
++    let (_dir, db_path) = isolated_metrics_db_path();
++    let config_dir = tempfile::tempdir().unwrap();
++    let config_path = config_dir.path().join("enterprise.json");
++    let cfg = json!({"enabled":true,"organization_id":"test-org",
++        "identity_secret":"integration-only-secret-long-enough",
++        "destinations":[{"id":"test","endpoint":"https://example.invalid/upload","token":"integration-fixture-token",
++            "ack":{"mode":"unconfirmed"},"event_types":["checkpoint","commit"]}]});
++    fs::write(&config_path, cfg.to_string()).unwrap();
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
++    }
++    let repo = TestRepo::new_with_daemon_env(&[
++        ("GIT_AI_TEST_METRICS_DB_PATH", db_path.as_str()),
++        (
++            "GIT_AI_TEST_ENTERPRISE_CONFIG",
++            config_path.to_str().unwrap(),
++        ),
++    ]);
++    repo.git(&[
++        "remote",
++        "add",
++        "origin",
++        "https://example.test/enterprise-repo.git",
++    ])
++    .unwrap();
++    repo.git(&["config", "user.email", "configured@company.test"])
++        .unwrap();
++    let path = repo.path().join("example.txt");
++    fs::write(&path, "base\n").unwrap();
++    repo.stage_all_and_commit("Initial commit").unwrap();
++    let mut file = repo.filename("example.txt");
++    file.assert_committed_lines(lines!["base".unattributed_human()]);
++    let hook = |event: &str| {
++        json!({"session_id":"test-enterprise-session","cwd":repo.canonical_path(),
++        "hook_event_name":event,"tool_name":"apply_patch","tool_use_id":"test-tool-use","model":"gpt-test",
++        "tool_input":{"patch":format!("*** Update File: {}\n",path.display())}}).to_string()
++    };
++    repo.git_ai(&["checkpoint", "codex", "--hook-input", &hook("PreToolUse")])
++        .unwrap();
++    fs::write(&path, "base\nai added\n").unwrap();
++    repo.git_ai(&["checkpoint", "codex", "--hook-input", &hook("PostToolUse")])
++        .unwrap();
++    repo.stage_all_and_commit("PRIVATE enterprise commit message")
++        .unwrap();
++    file.assert_committed_lines(lines!["base".unattributed_human(), "ai added".ai()]);
++    let expected_sha = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
++    let deadline = Instant::now() + Duration::from_secs(20);
++    loop {
++        // Explicit control wakes projection. No HTTP is possible with an unconfirmed ACK.
++        let status: Value =
++            serde_json::from_str(&repo.git_ai(&["enterprise-telemetry", "flush"]).unwrap())
++                .unwrap();
++        let conn = rusqlite::Connection::open(&db_path).unwrap();
++        let mut stmt = conn
++            .prepare("SELECT payload FROM enterprise_events ORDER BY created_at")
++            .unwrap();
++        let payloads: Vec<String> = stmt
++            .query_map([], |r| r.get(0))
++            .unwrap()
++            .collect::<Result<_, _>>()
++            .unwrap();
++        let values: Vec<Value> = payloads
++            .iter()
++            .map(|s| serde_json::from_str(s).unwrap())
++            .collect();
++        let checkpoint = values.iter().any(|v| {
++            v["event_type"] == "checkpoint" && v["kind"] == "ai_agent" && v["lines_added"] == 1
++        });
++        let commit = values
++            .iter()
++            .any(|v| v["event_type"] == "commit" && v["ai_additions"] == 1);
++        if checkpoint && commit {
++            for value in &values {
++                assert_eq!(value["user_id"], "configured@company.test");
++                assert_eq!(value["repo_id"], "https://example.test/enterprise-repo");
++                assert_eq!(value["client_version"], "development");
++            }
++            assert!(
++                values
++                    .iter()
++                    .any(|v| v["event_type"] == "commit" && v["commit_id"] == expected_sha)
++            );
++            let destinations: String = conn
++                .query_row(
++                    "SELECT destinations FROM enterprise_inbox LIMIT 1",
++                    [],
++                    |r| r.get(0),
++                )
++                .unwrap();
++            assert!(!destinations.contains("integration-fixture-token"));
++            for body in payloads {
++                for private in [
++                    "PRIVATE enterprise",
++                    "example.txt",
++                    "test@example.com",
++                    "test-enterprise-session",
++                ] {
++                    assert!(!body.contains(private));
++                }
++            }
++            assert_eq!(status["enabled"], true);
++            break;
++        }
++        assert!(
++            Instant::now() < deadline,
++            "two event types not projected; status={status}"
++        );
++        std::thread::sleep(Duration::from_millis(100));
++    }
++}
+diff --git a/tests/integration/main.rs b/tests/integration/main.rs
+index af4b46d2c..1fd0d17b9 100644
+--- a/tests/integration/main.rs
++++ b/tests/integration/main.rs
+@@ -60,6 +60,7 @@ mod diff_ignore_binary;
+ mod droid;
+ mod e2big_post_filter;
+ mod e2e_user_scenarios;
++mod enterprise_metrics;
+ mod event_timestamp_extraction;
+ mod fast_reader;
+ mod fetch_notes;

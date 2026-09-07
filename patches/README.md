@@ -27,3 +27,9 @@ change only `GIT_AI_VERSION`.
 
 Inactive diagnostic or recovery patches, if any, are documented in
 `../disabled-patches/README.md` and are never applied from this directory.
+
+- `enterprise-metrics.patch` adds independent checkpoint/commit enterprise
+  delivery and management. Apply it after `codebuddy-preset.patch`. Its baseline
+  is the exact `GIT_AI_VERSION` tag with the CodeBuddy patch applied.
+  Publisher embedding, automatic repository identity and the unconfirmed service-contract gate are described in
+  [enterprise telemetry](../docs/enterprise-metrics.md).

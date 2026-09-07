@@ -21,6 +21,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+      - name: Verify publisher configuration generator
+        run: python3 -m unittest discover -s scripts -p '*_test.py'
       - name: Run patched upstream regressions
         shell: bash
         run: scripts/test-patched-git-ai.sh
@@ -87,7 +89,11 @@ jobs:
       - name: Build git-ai sidecar
         shell: bash
         run: |
-          scripts/build-git-ai.sh --out dist/raw
+          version="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+          fi
+          scripts/build-git-ai.sh --out dist/raw --version "$version"
       - name: Verify executable architecture
         shell: bash
         run: |
