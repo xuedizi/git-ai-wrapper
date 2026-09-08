@@ -25,6 +25,9 @@ The wrapper intentionally carries three active downstream patches:
   Subagent-parent detection is intentionally deferred to a later version.
   Invalid event working directories fall back to the hook process directory,
   preserving valid CLI event directories; see [CLI/IDE cwd compatibility](docs/codebuddy-cwd.md).
+  IDE `filePath` inputs are accepted alongside CLI path fields. Explicit hook
+  models take priority; `auto` falls back to the existing transcript extractor
+  before being retained as `auto`.
 
 - `enterprise-metrics.patch` adds opt-in checkpoint/commit enterprise telemetry with publisher-embedded configuration and automatic Git email/remote identity:
   transactional inbox/outbox, allowlisted DTOs, independently acknowledged

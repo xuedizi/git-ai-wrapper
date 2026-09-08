@@ -26,7 +26,7 @@ diff --git a/src/commands/checkpoint_agent/presets/codebuddy.rs b/src/commands/c
 new file mode 100644
 --- /dev/null
 +++ b/src/commands/checkpoint_agent/presets/codebuddy.rs
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,317 @@
 +use super::parse;
 +use super::{
 +    AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
@@ -124,16 +124,29 @@ new file mode 100644
 +            agent_id: AgentId {
 +                tool: "codebuddy".to_string(),
 +                id: session_id.clone(),
-+                // CodeBuddy stores the model in a structured `providerData.model`
-+                // field of its JSONL transcript.
-+                model: crate::streams::model_extraction::extract_model(
-+                    Path::new(transcript_path),
-+                    crate::streams::sweep::StreamFormat::CodebuddyJsonl,
-+                    None,
-+                )
-+                .ok()
-+                .flatten()
-+                .unwrap_or_else(|| "unknown".to_string()),
++                // Prefer an explicit hook model. For auto/missing models, retain
++                // the existing CLI transcript extraction before using the hook fallback.
++                model: parse::optional_str(&data, "model")
++                    .map(str::trim)
++                    .filter(|model| !model.is_empty())
++                    .filter(|model| *model != "auto")
++                    .map(str::to_owned)
++                    .or_else(|| {
++                        crate::streams::model_extraction::extract_model(
++                            Path::new(transcript_path),
++                            crate::streams::sweep::StreamFormat::CodebuddyJsonl,
++                            None,
++                        )
++                        .ok()
++                        .flatten()
++                    })
++                    .or_else(|| {
++                        parse::optional_str(&data, "model")
++                            .map(str::trim)
++                            .filter(|model| !model.is_empty())
++                            .map(str::to_owned)
++                    })
++                    .unwrap_or_else(|| "unknown".to_string()),
 +            },
 +            external_session_id: session_id.clone(),
 +            trace_id: trace_id.to_string(),
@@ -275,6 +288,59 @@ new file mode 100644
 +                );
 +            }
 +            _ => panic!("Expected PostFileEdit"),
++        }
++    }
++    #[test]
++    fn test_codebuddy_hook_model_priority_and_cli_fallback() {
++        let (repo, input) = make_codebuddy_hook_input("PostToolUse", "Write");
++        let mut input: serde_json::Value = serde_json::from_str(&input).unwrap();
++        let transcript = repo.path().join("session.jsonl");
++        input["transcript_path"] = json!(transcript);
++        for (hook, transcript_content, expected) in [
++            (
++                json!("glm-5.3"),
++                r#"{"providerData":{"model":"cli-model"}}"#,
++                "glm-5.3",
++            ),
++            (
++                json!("auto"),
++                r#"{"providerData":{"model":"glm-5.3"}}"#,
++                "glm-5.3",
++            ),
++            (json!("auto"), "", "auto"),
++            (json!("auto"), r#"{"messages":[],"requests":[]}"#, "auto"),
++            (
++                json!(null),
++                r#"{"providerData":{"model":"cli-model"}}"#,
++                "cli-model",
++            ),
++            (
++                json!(null),
++                r#"{"providerData":{"requestModelId":"cli-request-model"}}"#,
++                "cli-request-model",
++            ),
++            (
++                json!(""),
++                r#"{"providerData":{"model":"cli-model"}}"#,
++                "cli-model",
++            ),
++            (json!(null), "", "unknown"),
++            (json!("glm-5.3"), "", "glm-5.3"),
++        ] {
++            std::fs::write(&transcript, transcript_content).unwrap();
++            input["model"] = hook;
++            for event in ["PreToolUse", "PostToolUse"] {
++                input["hook_event_name"] = json!(event);
++                let events = CodebuddyPreset
++                    .parse(&input.to_string(), "t_model")
++                    .unwrap();
++                let model = match &events[0] {
++                    ParsedHookEvent::PreFileEdit(e) => &e.context.agent_id.model,
++                    ParsedHookEvent::PostFileEdit(e) => &e.context.agent_id.model,
++                    _ => panic!("unexpected event"),
++                };
++                assert_eq!(model, expected, "hook={} event={event}", input["model"]);
++            }
 +        }
 +    }
 +}
@@ -840,7 +906,7 @@ diff --git a/tests/integration/codebuddy_cwd.rs b/tests/integration/codebuddy_cw
 new file mode 100644
 --- /dev/null
 +++ b/tests/integration/codebuddy_cwd.rs
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,301 @@
 +use crate::repos::test_file::ExpectedLineExt;
 +use crate::repos::test_repo::TestRepo;
 +use git_ai::commands::checkpoint_agent::presets::{ParsedHookEvent, resolve_preset};
@@ -1089,3 +1155,96 @@ new file mode 100644
 +            .any(|s| s.agent_id.tool == "codebuddy")
 +    );
 +}
++
++#[test]
++fn codebuddy_ide_camel_case_new_file_records_ai_lines() {
++    assert_ide_new_file_model("auto");
++}
++
++#[test]
++fn codebuddy_ide_explicit_model_records_ai_lines() {
++    assert_ide_new_file_model("glm-5.3");
++}
++
++fn assert_ide_new_file_model(model: &str) {
++    let repo = TestRepo::new();
++    fs::write(repo.path().join("baseline.txt"), "baseline\n").unwrap();
++    repo.stage_all_and_commit("baseline").unwrap();
++    let transcript = repo.path().join("session.jsonl");
++    fs::write(&transcript, "").unwrap();
++    let file = repo.path().join("New File.kt");
++    let mut input = json!({
++        "cwd": "/", "session_id": "ide-new-file-regression", "model": model,
++        "transcript_path": transcript,
++        "hook_event_name": "PreToolUse", "tool_name": "Write",
++        "tool_input": {"filePath": file, "content": "AI addition\n"}
++    });
++    repo.git_ai_with_stdin(
++        &["checkpoint", "codebuddy", "--hook-input", "stdin"],
++        input.to_string().as_bytes(),
++    )
++    .unwrap();
++    fs::write(&file, "AI addition\n").unwrap();
++    input["hook_event_name"] = json!("PostToolUse");
++    repo.git_ai_with_stdin(
++        &["checkpoint", "codebuddy", "--hook-input", "stdin"],
++        input.to_string().as_bytes(),
++    )
++    .unwrap();
++    let status: Value = serde_json::from_str(&repo.git_ai(&["status", "--json"]).unwrap()).unwrap();
++    assert!(
++        status["stats"]["ai_additions"].as_u64().unwrap_or(0) > 0,
++        "{status}"
++    );
++    let commit = repo.stage_all_and_commit("IDE new file").unwrap();
++    assert!(
++        commit
++            .authorship_log
++            .metadata
++            .sessions
++            .values()
++            .any(|session| session.agent_id.tool == "codebuddy" && session.agent_id.model == model)
++    );
++    repo.filename("New File.kt")
++        .assert_committed_lines(crate::lines!["AI addition".ai()]);
++}
+diff --git a/src/commands/checkpoint_agent/presets/parse.rs b/src/commands/checkpoint_agent/presets/parse.rs
+index 2acd776..c260127 100644
+--- a/src/commands/checkpoint_agent/presets/parse.rs
++++ b/src/commands/checkpoint_agent/presets/parse.rs
+@@ -59,6 +59,7 @@ pub fn file_paths_from_tool_input(data: &Value, cwd: &str) -> Vec<PathBuf> {
+         .get("file_path")
+         .or_else(|| tool_input.get("filepath"))
+         .or_else(|| tool_input.get("path"))
++        .or_else(|| tool_input.get("filePath"))
+         .and_then(|v| v.as_str())
+         && !path.is_empty()
+     {
+@@ -245,6 +246,27 @@ mod tests {
+         assert_eq!(paths, vec![PathBuf::from("/home/user/project/src/main.rs")]);
+     }
+ 
++    #[test]
++    fn test_file_paths_from_tool_input_aliases() {
++        for container in ["tool_input", "toolInput"] {
++            for key in ["file_path", "filepath", "path", "filePath"] {
++                for path in ["src/new file.rs", "/other/new file.rs"] {
++                    let data = json!({container: {key: path}});
++                    assert_eq!(
++                        file_paths_from_tool_input(&data, "/repo"),
++                        vec![resolve_absolute(path, "/repo")],
++                        "{data}"
++                    );
++                }
++            }
++        }
++        let data = json!({"tool_input": {"file_path": "cli.rs", "filePath": "ide.rs"}});
++        assert_eq!(
++            file_paths_from_tool_input(&data, "/repo"),
++            vec![PathBuf::from("/repo/cli.rs")]
++        );
++    }
++
+     #[test]
+     fn test_file_paths_from_tool_input_missing() {
+         let data = json!({"tool_input": {"command": "ls"}});

@@ -28,6 +28,31 @@ invalid event paths, spaces/subdirectories, failure of both sources, and real
 PreToolUse/PostToolUse edit and Bash checkpoints followed by commit attribution.
 Run `scripts/test-patched-git-ai.sh` to test the complete pinned patch stack.
 
-This fix does not change model extraction (`auto` is not a concrete model), IDE
-transcript parsing, or enterprise delivery configuration. A successful repository
+The cwd fix itself does not change model extraction, IDE transcript parsing,
+or enterprise delivery configuration. A successful repository
 lookup alone is not evidence that usage has reached the server.
+
+## IDE file paths
+
+CodeBuddy CN IDE Write/Edit events use `tool_input.filePath`. The shared tool
+input parser now accepts that spelling after the existing `file_path`,
+`filepath`, and `path` aliases; their precedence is unchanged. Both `tool_input`
+and `toolInput` containers are supported. This additive parser change also
+applies to other presets that call the shared parser, but does not change their
+working-directory selection.
+
+A regression creates a previously nonexistent file using the IDE event shape
+(`cwd: "/"`, `model: "auto"`, `filePath`), then checks AI additions in `status`
+and AI attribution after commit. This covers the missing field compatibility
+that the original CLI-shaped cwd regressions did not exercise. Files still
+need to have reached disk when the post-tool checkpoint reads them.
+
+## Hook model selection
+
+An explicit nonempty hook `model` (for example `glm-5.3`) takes priority.
+When the hook model is `auto`, the existing CodeBuddy CLI JSONL model extractor
+is tried first; if it finds no model, `auto` is retained. Missing or empty hook
+models follow the existing CLI transcript extraction and `unknown` fallback.
+The shared transcript extractor and other agent presets are unchanged. IDE
+`index.json` files without model metadata cannot supply a model; this change
+does not infer one from global settings or unrelated log entries.
