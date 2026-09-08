@@ -73,3 +73,5 @@ echo ">> running patched upstream tests (cargo test)"
 (cd "$WORK/src" && cargo test --locked --test integration test_edge_extension_recovery_metric_copies_source_session_tool_and_model)
 
 (cd "$WORK/src" && cargo test --locked --test integration install_hooks_target)
+
+(cd "$WORK/src" && cargo test --locked --test integration codebuddy_cwd)

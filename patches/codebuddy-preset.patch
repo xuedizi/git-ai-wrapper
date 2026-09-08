@@ -24,10 +24,9 @@ index 3dc8883..9990002 100644
  // ---------------------------------------------------------------------------
 diff --git a/src/commands/checkpoint_agent/presets/codebuddy.rs b/src/commands/checkpoint_agent/presets/codebuddy.rs
 new file mode 100644
-index 0000000..79dd697
 --- /dev/null
 +++ b/src/commands/checkpoint_agent/presets/codebuddy.rs
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,251 @@
 +use super::parse;
 +use super::{
 +    AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
@@ -37,10 +36,55 @@ index 0000000..79dd697
 +use crate::authorship::working_log::AgentId;
 +use crate::commands::checkpoint_agent::bash_tool::{self, Agent, ToolClass};
 +use crate::error::GitAiError;
++use crate::git::repository::validate_repository_path_no_git_exec;
 +use std::collections::HashMap;
 +use std::path::{Path, PathBuf};
 +
 +pub struct CodebuddyPreset;
++
++fn validate_cwd(path: &Path) -> Result<(), String> {
++    if !path.is_absolute() {
++        return Err("not an absolute path".to_string());
++    }
++    if !path.is_dir() {
++        return Err("not an existing directory".to_string());
++    }
++    validate_repository_path_no_git_exec(path).map_err(|error| error.to_string())
++}
++
++// CodeBuddy CN IDE can send cwd="/" despite starting the hook in the project.
++// Preserve valid CLI event directories (including subdirectories); only then
++// fall back to the actual process cwd. Never use PWD or change the process cwd.
++fn resolve_cwd(data: &serde_json::Value) -> Result<PathBuf, GitAiError> {
++    let event_cwd = parse::optional_str(data, "cwd");
++    let event_error = match event_cwd {
++        Some(cwd) => match validate_cwd(Path::new(cwd)) {
++            Ok(()) => return Ok(PathBuf::from(cwd)),
++            Err(error) => error,
++        },
++        None => "missing or non-string cwd".to_string(),
++    };
++    let process_cwd = std::env::current_dir().map_err(|error| {
++        GitAiError::PresetError(format!(
++            "CodeBuddy cwd resolution failed: event cwd={event_cwd:?}: {event_error}; getcwd failed: {error}"
++        ))
++    })?;
++    if let Err(process_error) = validate_cwd(&process_cwd) {
++        return Err(GitAiError::PresetError(format!(
++            "CodeBuddy cwd resolution failed: event cwd={event_cwd:?}: {event_error}; getcwd={}: {process_error}; no directory selected",
++            process_cwd.display()
++        )));
++    }
++    tracing::warn!(
++        event_cwd = ?event_cwd,
++        process_cwd = %process_cwd.display(),
++        selected_cwd = %process_cwd.display(),
++        cwd_source = "getcwd",
++        reason = %event_error,
++        "CodeBuddy invalid event cwd; using hook process directory"
++    );
++    Ok(process_cwd)
++}
 +
 +impl AgentPreset for CodebuddyPreset {
 +    fn parse(&self, hook_input: &str, trace_id: &str) -> Result<Vec<ParsedHookEvent>, GitAiError> {
@@ -55,7 +99,10 @@ index 0000000..79dd697
 +            return Ok(Vec::new());
 +        }
 +
-+        let cwd = parse::required_str(&data, "cwd")?;
++        let resolved_cwd = resolve_cwd(&data)?;
++        let cwd = resolved_cwd.to_str().ok_or_else(|| {
++            GitAiError::PresetError("CodeBuddy getcwd is not valid UTF-8".to_string())
++        })?;
 +        let transcript_path = parse::required_str(&data, "transcript_path")?;
 +
 +        // Session ID: prefer hook `session_id` / `sessionId`, fall back to the
@@ -143,29 +190,39 @@ index 0000000..79dd697
 +    use crate::commands::checkpoint_agent::presets::*;
 +    use serde_json::json;
 +
-+    fn make_codebuddy_hook_input(event: &str, tool: &str) -> String {
-+        json!({
++    fn make_codebuddy_hook_input(event: &str, tool: &str) -> (tempfile::TempDir, String) {
++        let repo = tempfile::tempdir().unwrap();
++        assert!(
++            std::process::Command::new("git")
++                .args(["init", "--quiet"])
++                .arg(repo.path())
++                .status()
++                .unwrap()
++                .success()
++        );
++        let input = json!({
 +            "transcript_path": "/home/user/.codebuddy/projects/proj/abc123.jsonl",
-+            "cwd": "/home/user/project",
++            "cwd": repo.path(),
 +            "hook_event_name": event,
 +            "tool_name": tool,
 +            "session_id": "sess-1",
 +            "tool_use_id": "tu-1",
 +            "tool_input": {"file_path": "src/main.rs"}
 +        })
-+        .to_string()
++        .to_string();
++        (repo, input)
 +    }
 +
 +    #[test]
 +    fn test_codebuddy_pre_file_edit() {
-+        let input = make_codebuddy_hook_input("PreToolUse", "Write");
++        let (_repo, input) = make_codebuddy_hook_input("PreToolUse", "Write");
 +        let events = CodebuddyPreset.parse(&input, "t_test123456789a").unwrap();
 +        assert_eq!(events.len(), 1);
 +        match &events[0] {
 +            ParsedHookEvent::PreFileEdit(e) => {
 +                assert_eq!(e.context.agent_id.tool, "codebuddy");
 +                assert_eq!(e.context.external_session_id, "sess-1");
-+                assert_eq!(e.file_paths, vec![PathBuf::from("/home/user/project/src/main.rs")]);
++                assert_eq!(e.file_paths, vec![_repo.path().join("src/main.rs")]);
 +            }
 +            _ => panic!("Expected PreFileEdit"),
 +        }
@@ -173,7 +230,7 @@ index 0000000..79dd697
 +
 +    #[test]
 +    fn test_codebuddy_post_file_edit() {
-+        let input = make_codebuddy_hook_input("PostToolUse", "Write");
++        let (_repo, input) = make_codebuddy_hook_input("PostToolUse", "Write");
 +        let events = CodebuddyPreset.parse(&input, "t_test123456789a").unwrap();
 +        match &events[0] {
 +            ParsedHookEvent::PostFileEdit(e) => {
@@ -189,17 +246,21 @@ index 0000000..79dd697
 +    #[test]
 +    fn test_codebuddy_ignores_read_only_tools() {
 +        for tool_name in ["Read", "Glob", "Grep"] {
-+            let input = make_codebuddy_hook_input("PostToolUse", tool_name);
++            let (_repo, input) = make_codebuddy_hook_input("PostToolUse", tool_name);
 +            let events = CodebuddyPreset.parse(&input, "t_test123456789a").unwrap();
-+            assert!(events.is_empty(), "{tool_name} unexpectedly produced events");
++            assert!(
++                events.is_empty(),
++                "{tool_name} unexpectedly produced events"
++            );
 +        }
 +    }
 +
 +    #[test]
 +    fn test_codebuddy_session_id_from_filename() {
++        let (repo, _) = make_codebuddy_hook_input("PostToolUse", "Write");
 +        let input = json!({
 +            "transcript_path": "/home/user/.codebuddy/projects/proj/9f8e7d6c-1234-abcd-5678-ef9012345678.jsonl",
-+            "cwd": "/home/user/project",
++            "cwd": repo.path(),
 +            "hook_event_name": "PostToolUse",
 +            "tool_name": "Write",
 +            "tool_input": {"file_path": "src/main.rs"}
@@ -713,3 +774,318 @@ index 3ae6136..88d09a7 100644
              | Self::CopilotEventStreamJsonl => WatermarkType::ByteOffset,
              Self::DroidJsonl => WatermarkType::Hybrid,
              Self::CopilotSessionJson | Self::ContinueJson | Self::AmpThreadJson => {
+diff --git a/src/git/repository.rs b/src/git/repository.rs
+--- a/src/git/repository.rs
++++ b/src/git/repository.rs
+@@ -2445,6 +2445,25 @@
+     })
+ }
+ 
++/// Validate discovery without constructing Repository or initializing AI storage.
++/// Storage failures must not cause callers to select a different repository.
++pub(crate) fn validate_repository_path_no_git_exec(path: &Path) -> Result<(), GitAiError> {
++    let paths = discover_repository_paths_no_git_exec(path)?;
++    if !is_valid_git_dir(&paths.git_dir)
++        || !paths.git_common_dir.is_dir()
++        || !paths.workdir.is_dir()
++    {
++        return Err(GitAiError::Generic(format!(
++            "Invalid Git repository paths for {} (git_dir={}, common_dir={}, workdir={})",
++            path.display(),
++            paths.git_dir.display(),
++            paths.git_common_dir.display(),
++            paths.workdir.display()
++        )));
++    }
++    Ok(())
++}
++
+ pub fn discover_repository_in_path_no_git_exec(path: &Path) -> Result<Repository, GitAiError> {
+     let paths = discover_repository_paths_no_git_exec(path)?;
+     repository_from_discovered_paths(
+diff --git a/tests/integration/main.rs b/tests/integration/main.rs
+--- a/tests/integration/main.rs
++++ b/tests/integration/main.rs
+@@ -40,6 +40,7 @@
+ mod ci_partial_clone;
+ mod ci_squash_rebase;
+ mod claude_code;
++mod codebuddy_cwd;
+ mod cli_parser_rebase_args;
+ mod codex;
+ mod cold_trace2_repo;
+diff --git a/tests/integration/repos/test_repo.rs b/tests/integration/repos/test_repo.rs
+--- a/tests/integration/repos/test_repo.rs
++++ b/tests/integration/repos/test_repo.rs
+@@ -1014,6 +1014,7 @@
+     matches!(
+         arg,
+         "claude"
++            | "codebuddy"
+             | "codex"
+             | "continue-cli"
+             | "cursor"
+diff --git a/tests/integration/repos/test_file.rs b/tests/integration/repos/test_file.rs
+--- a/tests/integration/repos/test_file.rs
++++ b/tests/integration/repos/test_file.rs
+@@ -8,6 +8,7 @@
+ const AI_AUTHOR_NAMES: &[&str] = &[
+     "mock_ai",
+     "claude",
++    "codebuddy",
+     "continue-cli",
+     "gpt",
+     "copilot",
+diff --git a/tests/integration/codebuddy_cwd.rs b/tests/integration/codebuddy_cwd.rs
+new file mode 100644
+--- /dev/null
++++ b/tests/integration/codebuddy_cwd.rs
+@@ -0,0 +1,248 @@
++use crate::repos::test_file::ExpectedLineExt;
++use crate::repos::test_repo::TestRepo;
++use git_ai::commands::checkpoint_agent::presets::{ParsedHookEvent, resolve_preset};
++use serde_json::{Value, json};
++use std::fs;
++use std::path::Path;
++use std::process::Command;
++
++// Run parsing in a child test process so cwd changes never race other tests.
++#[test]
++fn codebuddy_cwd_probe() {
++    let Ok(case) = std::env::var("CODEBUDDY_CWD_TEST_CASE") else {
++        return;
++    };
++    let case: Value = serde_json::from_str(&case).unwrap();
++    let expected = case["expected"].as_str();
++    for event in ["PreToolUse", "PostToolUse"] {
++        for tool in ["Write", "Bash"] {
++            let mut input = json!({
++                "transcript_path": "/unused/codebuddy.jsonl",
++                "session_id": "cwd-regression",
++                "hook_event_name": event,
++                "tool_name": tool,
++                "tool_input": {"file_path": "src/main.rs", "command": "echo test"}
++            });
++            if let Some(cwd) = case.get("cwd") {
++                input["cwd"] = cwd.clone();
++            }
++            let result = resolve_preset("codebuddy")
++                .unwrap()
++                .parse(&input.to_string(), "t_cwd");
++            let Some(expected) = expected else {
++                let error = result
++                    .expect_err("neither directory identifies a repository")
++                    .to_string();
++                assert!(error.contains("cwd"), "{error}");
++                assert!(error.contains("getcwd"), "{error}");
++                continue;
++            };
++            let events = result.unwrap();
++            assert_eq!(events.len(), 1);
++            let (context, paths) = match &events[0] {
++                ParsedHookEvent::PreFileEdit(e) => (&e.context, Some(&e.file_paths)),
++                ParsedHookEvent::PostFileEdit(e) => (&e.context, Some(&e.file_paths)),
++                ParsedHookEvent::PreBashCall(e) => (&e.context, None),
++                ParsedHookEvent::PostBashCall(e) => (&e.context, None),
++                _ => panic!("unexpected event"),
++            };
++            assert_eq!(context.cwd, Path::new(expected));
++            if let Some(paths) = paths {
++                assert_eq!(paths, &[Path::new(expected).join("src/main.rs")]);
++            }
++        }
++    }
++}
++
++fn probe(process_cwd: &Path, case: Value) {
++    let output = Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "codebuddy_cwd::codebuddy_cwd_probe",
++            "--nocapture",
++        ])
++        .current_dir(process_cwd)
++        .env("CODEBUDDY_CWD_TEST_CASE", case.to_string())
++        // These must not override either real cwd source.
++        .env("PWD", "/incorrect-pwd")
++        .env("CODEBUDDY_PROJECT_DIR", "/incorrect-project")
++        .env("CLAUDE_PROJECT_DIR", "/incorrect-project")
++        .output()
++        .unwrap();
++    assert!(
++        output.status.success(),
++        "{}\n{}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++}
++
++fn init_repo(path: &Path) {
++    fs::create_dir_all(path).unwrap();
++    assert!(
++        Command::new("git")
++            .env(
++                "GIT_CONFIG_GLOBAL",
++                path.parent().unwrap().join("no-global-config")
++            )
++            .env("GIT_CONFIG_NOSYSTEM", "1")
++            .env_remove("GIT_TRACE2_EVENT")
++            .args(["-c", "init.defaultBranch=main", "init", "--quiet"])
++            .arg(path)
++            .status()
++            .unwrap()
++            .success()
++    );
++}
++
++#[test]
++fn codebuddy_cwd_cli_preserves_valid_event_directory() {
++    let tmp = tempfile::tempdir().unwrap();
++    let root = tmp.path().canonicalize().unwrap();
++    let event_repo = root.join("event repo");
++    let process_repo = root.join("process repo");
++    init_repo(&event_repo);
++    init_repo(&process_repo);
++    let sub = event_repo.join("nested dir");
++    fs::create_dir(&sub).unwrap();
++    probe(&process_repo, json!({"cwd": sub, "expected": sub}));
++    // A valid event must also work when the process cwd is not a repository.
++    probe(&root, json!({"cwd": sub, "expected": sub}));
++    assert!(!event_repo.join(".git/ai").exists());
++    assert!(!process_repo.join(".git/ai").exists());
++}
++
++#[test]
++fn codebuddy_cwd_ide_falls_back_for_invalid_event_directories() {
++    let tmp = tempfile::tempdir().unwrap();
++    let root = tmp.path().canonicalize().unwrap();
++    let repo = root.join("project with spaces");
++    init_repo(&repo);
++    let sub = repo.join("nested dir");
++    fs::create_dir(&sub).unwrap();
++    for cwd in [
++        json!("/"),
++        json!("relative"),
++        json!(""),
++        Value::Null,
++        json!(root),
++        json!(repo.join("missing")),
++        json!(42),
++    ] {
++        probe(&sub, json!({"cwd": cwd, "expected": sub}));
++    }
++    probe(&sub, json!({"expected": sub}));
++}
++
++#[test]
++fn codebuddy_cwd_rejects_when_both_sources_are_invalid() {
++    let tmp = tempfile::tempdir().unwrap();
++    probe(tmp.path(), json!({"cwd": "/", "expected": null}));
++    probe(tmp.path(), json!({"expected": null}));
++}
++
++#[test]
++fn codebuddy_cwd_falls_back_from_broken_git_pointer() {
++    let tmp = tempfile::tempdir().unwrap();
++    let root = tmp.path().canonicalize().unwrap();
++    let event_dir = root.join("broken worktree");
++    let process_repo = root.join("process");
++    fs::create_dir(&event_dir).unwrap();
++    init_repo(&process_repo);
++    fs::write(event_dir.join(".git"), "gitdir: ../missing-metadata\n").unwrap();
++    probe(
++        &process_repo,
++        json!({"cwd": event_dir, "expected": process_repo}),
++    );
++    fs::create_dir(root.join("missing-metadata")).unwrap();
++    probe(
++        &process_repo,
++        json!({"cwd": event_dir, "expected": process_repo}),
++    );
++}
++
++#[test]
++fn codebuddy_cwd_preserves_event_repo_with_unusable_ai_storage() {
++    let tmp = tempfile::tempdir().unwrap();
++    let root = tmp.path().canonicalize().unwrap();
++    let event_repo = root.join("event");
++    let process_repo = root.join("process");
++    init_repo(&event_repo);
++    init_repo(&process_repo);
++    fs::write(event_repo.join(".git/ai"), "blocked storage").unwrap();
++    probe(
++        &process_repo,
++        json!({"cwd": event_repo, "expected": event_repo}),
++    );
++    assert!(
++        !process_repo.join(".git/ai").exists(),
++        "discovery must not initialize storage"
++    );
++}
++
++#[test]
++fn codebuddy_cwd_fallback_records_committed_ai_lines() {
++    assert_fallback_records_committed_ai_lines("Write");
++}
++
++#[test]
++fn codebuddy_cwd_bash_fallback_records_committed_ai_lines() {
++    assert_fallback_records_committed_ai_lines("Bash");
++}
++
++fn assert_fallback_records_committed_ai_lines(tool: &str) {
++    let repo = TestRepo::new();
++    let file = repo.path().join("example.txt");
++    fs::write(&file, "original\n").unwrap();
++    repo.stage_all_and_commit("baseline").unwrap();
++    repo.filename("example.txt")
++        .assert_committed_lines(crate::lines!["original".unattributed_human()]);
++    let transcript = repo.path().join("session.jsonl");
++    fs::write(&transcript, "").unwrap();
++    let mut input = json!({
++        "cwd": "/", "session_id": "ide-cwd-regression", "model": "auto",
++        "transcript_path": transcript,
++        "hook_event_name": "PreToolUse", "tool_name": tool,
++        "tool_use_id": "write-1", "tool_input": {"file_path": "example.txt", "command": "echo AI addition >> example.txt"}
++    });
++    let checkpoint_output = repo
++        .git_ai_with_stdin(
++            &["checkpoint", "codebuddy", "--hook-input", "stdin"],
++            input.to_string().as_bytes(),
++        )
++        .unwrap();
++    assert!(
++        checkpoint_output.contains("checkpoint_requests="),
++        "{checkpoint_output}"
++    );
++    fs::write(&file, "original\nAI addition\n").unwrap();
++    input["hook_event_name"] = json!("PostToolUse");
++    let checkpoint_output = repo
++        .git_ai_with_stdin(
++            &["checkpoint", "codebuddy", "--hook-input", "stdin"],
++            input.to_string().as_bytes(),
++        )
++        .unwrap();
++    assert!(
++        checkpoint_output.contains("checkpoint_requests="),
++        "{checkpoint_output}"
++    );
++    let status: Value = serde_json::from_str(&repo.git_ai(&["status", "--json"]).unwrap()).unwrap();
++    assert!(status["stats"]["ai_additions"].as_u64().unwrap() > 0);
++    let commit = repo
++        .stage_all_and_commit("AI edit with IDE cwd fallback")
++        .unwrap();
++    repo.filename("example.txt")
++        .assert_committed_lines(crate::lines![
++            "original".unattributed_human(),
++            "AI addition".ai()
++        ]);
++    assert!(
++        commit
++            .authorship_log
++            .metadata
++            .sessions
++            .values()
++            .any(|s| s.agent_id.tool == "codebuddy")
++    );
++}

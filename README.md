@@ -23,6 +23,8 @@ The wrapper intentionally carries three active downstream patches:
   stream format with a dedicated model extractor, a `Codebuddy` tool classifier,
   and a `CodebuddyInstaller` that writes hooks into `~/.codebuddy/settings.json`.
   Subagent-parent detection is intentionally deferred to a later version.
+  Invalid event working directories fall back to the hook process directory,
+  preserving valid CLI event directories; see [CLI/IDE cwd compatibility](docs/codebuddy-cwd.md).
 
 - `enterprise-metrics.patch` adds opt-in checkpoint/commit enterprise telemetry with publisher-embedded configuration and automatic Git email/remote identity:
   transactional inbox/outbox, allowlisted DTOs, independently acknowledged
