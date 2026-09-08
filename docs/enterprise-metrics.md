@@ -158,10 +158,10 @@ Do not copy/rebuild a source database to replay historical checkpoints with new
 IDs: this release only captures new source inserts and does not provide backfill.
 
 ```text
-tcli telemetry status   # JSON counts, oldest age, ACKs, scope/contract errors,
+tcli ga enterprise-telemetry status   # JSON counts, oldest age, ACKs, scope/contract errors,
                         # losses, type blocks, direct/recovery and trace coverage
-tcli telemetry flush    # wake one asynchronous worker pass; not a delivery ACK
-tcli telemetry retry    # resume retryable/blocked work; preserve event IDs
+tcli ga enterprise-telemetry flush    # wake one asynchronous worker pass; not a delivery ACK
+tcli ga enterprise-telemetry retry    # resume retryable/blocked work; preserve event IDs
 ```
 
 Management uses the bundled sidecar's `enterprise-telemetry` control command.

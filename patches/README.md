@@ -31,5 +31,14 @@ Inactive diagnostic or recovery patches, if any, are documented in
 - `enterprise-metrics.patch` adds independent checkpoint/commit enterprise
   delivery and management. Apply it after `codebuddy-preset.patch`. Its baseline
   is the exact `GIT_AI_VERSION` tag with the CodeBuddy patch applied.
+  Includes the Native TLS/platform trust configuration and a loopback HTTPS
+  regression preventing the missing-Rustls-provider panic.
   Publisher embedding, automatic repository identity and the unconfirmed service-contract gate are described in
   [enterprise telemetry](../docs/enterprise-metrics.md).
+
+- `install-hooks-target.patch` adds only `--target` to native `install-hooks`
+  (and its `install` alias). Apply after the existing patches. Targets use
+  registered installer IDs; selection gates both hooks and extras, preserves
+  all Skills, and survives dry-run apply suggestions. Targeted uninstall is
+  explicitly rejected. Includes parser and isolated TestRepo regressions.
+  See [parameter contract](../docs/install-hooks-target.md).

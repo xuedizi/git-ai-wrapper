@@ -37,11 +37,12 @@ fi
 expected_patch_names=(
 	"codebuddy-preset.patch"
 	"enterprise-metrics.patch"
+	"install-hooks-target.patch"
 )
 actual_patch_names=$(printf '%s\n' "${active_patch_names[@]}")
 expected_patch_names_text=$(printf '%s\n' "${expected_patch_names[@]}")
 [ "$actual_patch_names" = "$expected_patch_names_text" ] || {
-	echo "test-patched-git-ai.sh: expected active codebuddy-preset.patch and enterprise-metrics.patch; got: $actual_patch_names" >&2
+	echo "test-patched-git-ai.sh: unexpected active patch list; expected $expected_patch_names_text; got: $actual_patch_names" >&2
 	exit 1
 }
 
@@ -63,8 +64,12 @@ for patch_file in "${active_patch_files[@]}"; do
 done
 
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+# Local HTTP/TLS fixtures must not be routed through an external proxy.
+export NO_PROXY="127.0.0.1,localhost,${NO_PROXY:-${no_proxy:-}}"
 echo ">> running patched upstream tests (cargo test)"
 (cd "$WORK/src" && cargo test --locked --lib)
 (cd "$WORK/src" && cargo test --locked --test integration enterprise_metrics)
 
 (cd "$WORK/src" && cargo test --locked --test integration test_edge_extension_recovery_metric_copies_source_session_tool_and_model)
+
+(cd "$WORK/src" && cargo test --locked --test integration install_hooks_target)

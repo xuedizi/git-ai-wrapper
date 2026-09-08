@@ -1,0 +1,373 @@
+diff --git a/src/commands/install_hooks.rs b/src/commands/install_hooks.rs
+--- a/src/commands/install_hooks.rs
++++ b/src/commands/install_hooks.rs
+@@ -6,7 +6,7 @@
+ use crate::mdm::skills_installer;
+ use crate::mdm::spinner::{Spinner, print_diff};
+ use crate::mdm::utils::get_current_binary_path;
+-use std::collections::{HashMap, HashSet};
++use std::collections::{BTreeSet, HashMap, HashSet};
+ use std::fs;
+ use std::path::{Path, PathBuf};
+ use std::process::{Command, Stdio};
+@@ -18,6 +18,7 @@
+ 
+ #[derive(Debug, Clone, Default, PartialEq, Eq)]
+ struct InstallOptions {
++    targets: Option<BTreeSet<String>>,
+     dry_run: bool,
+     verbose: bool,
+     install_skills: bool,
+@@ -402,6 +403,15 @@
+             "--dry-run" | "--dry-run=true" => options.dry_run = true,
+             "--verbose" | "-v" => options.verbose = true,
+             "--skills" => options.install_skills = true,
++            "--target" => {
++                let value = args
++                    .next()
++                    .ok_or_else(|| GitAiError::Generic("missing value for --target".to_string()))?;
++                parse_targets(value, &mut options)?;
++            }
++            value if value.starts_with("--target=") => {
++                parse_targets(&value[9..], &mut options)?;
++            }
+             "--visual-studio-extension" => options.include_visual_studio_extension = true,
+             "--env" | "--env=true" => options.configure_env = true,
+             "--wsl" | "--wsl=true" => options.configure_wsl = true,
+@@ -427,7 +437,32 @@
+         }
+     }
+ 
++    if options.targets.is_some() && options.install_skills {
++        return Err(GitAiError::Generic(
++            "--target cannot be combined with --skills: Skills use shared directories".to_string(),
++        ));
++    }
+     Ok(options)
++}
++
++fn parse_targets(value: &str, options: &mut InstallOptions) -> Result<(), GitAiError> {
++    let available: BTreeSet<String> = get_all_installers()
++        .iter()
++        .map(|installer| installer.id().to_string())
++        .collect();
++    for target in value.split(',').map(str::trim) {
++        if !available.contains(target) {
++            return Err(GitAiError::Generic(format!(
++                "invalid --target {target:?}. Available targets on this platform: {}",
++                available.into_iter().collect::<Vec<_>>().join(", ")
++            )));
++        }
++        options
++            .targets
++            .get_or_insert_with(BTreeSet::new)
++            .insert(target.to_string());
++    }
++    Ok(())
+ }
+ 
+ fn non_empty_value(value: &str) -> Option<String> {
+@@ -436,6 +471,11 @@
+ }
+ 
+ fn should_include_installer(id: &str, options: &InstallOptions) -> bool {
++    if let Some(targets) = &options.targets
++        && !targets.contains(id)
++    {
++        return false;
++    }
+     options.include_visual_studio_extension || id != VISUAL_STUDIO_INSTALLER_ID
+ }
+ 
+@@ -543,6 +583,14 @@
+ 
+ /// Main entry point for uninstall-hooks command
+ pub fn run_uninstall(args: &[String]) -> Result<HashMap<String, String>, GitAiError> {
++    if args
++        .iter()
++        .any(|arg| arg == "--target" || arg.starts_with("--target="))
++    {
++        return Err(GitAiError::Generic(
++            "--target is only supported by install-hooks (and its install alias)".to_string(),
++        ));
++    }
+     // Parse flags
+     let mut dry_run = false;
+     let mut verbose = false;
+@@ -594,6 +642,9 @@
+         match installer.check_hooks(params) {
+             Ok(check_result) => {
+                 if !check_result.tool_installed {
++                    if options.targets.is_some() {
++                        println!("{name}: Not installed; skipping");
++                    }
+                     statuses.insert(id.to_string(), InstallStatus::NotFound);
+                     detailed_results.push((id.to_string(), InstallResult::not_found()));
+                     continue;
+@@ -747,7 +798,8 @@
+         {
+             has_changes = true;
+         }
+-    } else if let Ok(result) = skills_installer::uninstall_skills(options.dry_run, options.verbose)
++    } else if options.targets.is_none()
++        && let Ok(result) = skills_installer::uninstall_skills(options.dry_run, options.verbose)
+         && result.changed
+     {
+         has_changes = true;
+@@ -758,11 +810,28 @@
+     } else if has_changes && options.dry_run {
+         // Keep optional setup flags in the suggested re-run so the requested
+         // configuration is not silently dropped when the user applies changes.
++        let target_flag = options
++            .targets
++            .as_ref()
++            .map_or_else(String::new, |targets| {
++                format!(
++                    " --target {}",
++                    targets.iter().cloned().collect::<Vec<_>>().join(",")
++                )
++            });
++        let visual_studio_flag =
++            if options.targets.is_some() && options.include_visual_studio_extension {
++                " --visual-studio-extension"
++            } else {
++                ""
++            };
+         let env_flag = if options.configure_env { " --env" } else { "" };
+         let wsl_flag = if options.configure_wsl { " --wsl" } else { "" };
+         println!("\n\x1b[33m⚠ Dry-run mode (default). No changes were made.\x1b[0m");
+         println!("To apply these changes, run:");
+-        println!("\x1b[1m  git-ai install-hooks --dry-run=false{env_flag}{wsl_flag}\x1b[0m");
++        println!(
++            "\x1b[1m  git-ai install-hooks --dry-run=false{target_flag}{visual_studio_flag}{env_flag}{wsl_flag}\x1b[0m"
++        );
+     }
+ 
+     // Check for running agents that had hooks updated and warn about restart
+@@ -1051,6 +1120,56 @@
+     use std::path::PathBuf;
+     use tempfile::tempdir;
+ 
++    #[test]
++    fn target_options_select_only_requested_installers() {
++        let args = ["--target", " codex,codebuddy ", "--target=cursor,codex"].map(str::to_string);
++        let options = parse_install_options(&args).unwrap();
++        for id in ["codex", "codebuddy", "cursor"] {
++            assert!(should_include_installer(id, &options), "missing {id}");
++        }
++        for id in ["claude-code", "vscode", "jetbrains", "visual-studio"] {
++            assert!(!should_include_installer(id, &options), "unexpected {id}");
++        }
++    }
++
++    #[test]
++    fn target_options_reject_invalid_values_and_skills() {
++        for args in [
++            vec!["--target"],
++            vec!["--target="],
++            vec!["--target", "codex,"],
++            vec!["--target=codex,,cursor"],
++            vec!["--target=Codex"],
++            vec!["--target=unknown"],
++            vec!["--target=all"],
++            vec!["--target", "--dry-run"],
++            vec!["--target=codex", "--skills"],
++            vec!["--skills", "--target=codex"],
++        ] {
++            let args: Vec<String> = args.into_iter().map(str::to_string).collect();
++            assert!(parse_install_options(&args).is_err(), "accepted {args:?}");
++        }
++    }
++
++    #[test]
++    fn target_options_preserve_native_flags() {
++        let args = [
++            "--target=codex",
++            "--env",
++            "--wsl",
++            "--visual-studio-extension",
++            "--dry-run",
++            "-v",
++        ]
++        .map(str::to_string);
++        let options = parse_install_options(&args).unwrap();
++        assert!(
++            options.configure_env && options.configure_wsl && options.verbose && options.dry_run
++        );
++        assert!(should_include_installer("codex", &options));
++        assert!(!should_include_installer("visual-studio", &options));
++    }
++
+     struct EnvVarGuard {
+         key: &'static str,
+         old: Option<String>,
+diff --git a/src/commands/git_ai_handlers.rs b/src/commands/git_ai_handlers.rs
+--- a/src/commands/git_ai_handlers.rs
++++ b/src/commands/git_ai_handlers.rs
+@@ -396,6 +396,21 @@
+     eprintln!(
+         "    --wsl                  Also install git-ai in eligible WSL distributions (Windows only)"
+     );
++    eprintln!(
++        "    --target <id[,id...]>   Install only selected tools; repeatable, skips Skills cleanup"
++    );
++    eprintln!(
++        "                           Cannot be combined with --skills; does not select uninstall targets"
++    );
++    let mut targets: Vec<_> = crate::mdm::agents::get_all_installers()
++        .iter()
++        .map(|installer| installer.id().to_string())
++        .collect();
++    targets.sort();
++    eprintln!(
++        "                           Targets on this platform: {}",
++        targets.join(", ")
++    );
+     eprintln!("    --skills               Also install agent skill files");
+     eprintln!("    --visual-studio-extension");
+     eprintln!("                           Also install the Visual Studio extension on Windows");
+diff --git a/tests/integration/install_hooks_comprehensive.rs b/tests/integration/install_hooks_comprehensive.rs
+--- a/tests/integration/install_hooks_comprehensive.rs
++++ b/tests/integration/install_hooks_comprehensive.rs
+@@ -929,3 +929,141 @@
+         assert_eq!(result2.get(key), Some(value));
+     }
+ }
++
++// Targeted installs must not enter another tool's installer or global Skills cleanup.
++#[test]
++fn install_hooks_target_preserves_unselected_tools_and_skills() {
++    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
++    let home = repo.test_home_path();
++    let protected = [
++        ".claude/settings.json",
++        ".cursor/hooks.json",
++        ".codex/config.toml",
++        ".git-ai/skills/prompt-analysis/SKILL.md",
++        ".agents/skills/prompt-analysis/SKILL.md",
++        ".claude/skills/prompt-analysis/SKILL.md",
++        ".cursor/skills/prompt-analysis/SKILL.md",
++    ];
++    for path in protected {
++        let path = home.join(path);
++        fs::create_dir_all(path.parent().unwrap()).unwrap();
++        fs::write(path, "# preserve user content\n").unwrap();
++    }
++    fs::create_dir_all(home.join(".codebuddy")).unwrap();
++    fs::write(
++        home.join(".codebuddy/settings.json"),
++        "{\"userSetting\":true}",
++    )
++    .unwrap();
++    let mut previous = None;
++    for _ in 0..2 {
++        let output = repo
++            .git_ai_command_without_pre_sync_for_test(
++                &["install-hooks", "--target", "codebuddy", "--dry-run=false"],
++                &[],
++            )
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "{}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        let content = fs::read(home.join(".codebuddy/settings.json")).unwrap();
++        let settings: serde_json::Value = serde_json::from_slice(&content).unwrap();
++        assert_eq!(settings["userSetting"], true);
++        assert!(settings["hooks"]["PreToolUse"].is_array());
++        assert!(settings["hooks"]["PostToolUse"].is_array());
++        if let Some(previous) = previous {
++            assert_eq!(content, previous);
++        }
++        previous = Some(content);
++        for path in protected {
++            assert_eq!(
++                fs::read_to_string(home.join(path)).unwrap(),
++                "# preserve user content\n",
++                "changed {path}"
++            );
++        }
++        let stdout = String::from_utf8_lossy(&output.stdout);
++        for name in [
++            "Claude Code:",
++            "Cursor:",
++            "Codex:",
++            "VS Code:",
++            "Android Studio:",
++        ] {
++            assert!(!stdout.contains(name), "unexpected installer: {stdout}");
++        }
++    }
++}
++
++#[test]
++fn install_hooks_target_dry_run_preserves_files_and_suggestion() {
++    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
++    let home = repo.test_home_path();
++    for tool in [".codebuddy", ".claude"] {
++        fs::create_dir_all(home.join(tool)).unwrap();
++        fs::write(home.join(tool).join("settings.json"), "{}").unwrap();
++    }
++    let output = repo
++        .git_ai_command_without_pre_sync_for_test(
++            &[
++                "install-hooks",
++                "--target=codebuddy,claude-code",
++                "--target=codebuddy",
++                "--visual-studio-extension",
++                "--dry-run",
++            ],
++            &[],
++        )
++        .output()
++        .unwrap();
++    assert!(
++        output.status.success(),
++        "{}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    assert!(stdout.contains("CodeBuddy:"), "{stdout}");
++    assert!(stdout.contains("Claude Code:"), "{stdout}");
++    assert!(
++        stdout.contains("--dry-run=false --target claude-code,codebuddy --visual-studio-extension"),
++        "{stdout}"
++    );
++    for tool in [".codebuddy", ".claude"] {
++        assert_eq!(
++            fs::read_to_string(home.join(tool).join("settings.json")).unwrap(),
++            "{}"
++        );
++    }
++}
++
++#[test]
++fn install_hooks_target_invalid_and_uninstall_rejected_before_writes() {
++    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
++    let home = repo.test_home_path();
++    fs::create_dir_all(home.join(".codebuddy")).unwrap();
++    let settings = home.join(".codebuddy/settings.json");
++    fs::write(&settings, "{\"hooks\":{}}").unwrap();
++    let gitconfig_before = fs::read(home.join(".gitconfig")).ok();
++    for args in [
++        vec!["install-hooks", "--target=unknown", "--env"],
++        vec!["install-hooks", "--target=codebuddy", "--skills"],
++        vec!["uninstall-hooks", "--target=codebuddy"],
++        vec!["uninstall", "--target", "codebuddy"],
++    ] {
++        let output = repo
++            .git_ai_command_without_pre_sync_for_test(&args, &[])
++            .output()
++            .unwrap();
++        assert!(
++            !output.status.success(),
++            "accepted {args:?}: {}",
++            String::from_utf8_lossy(&output.stdout)
++        );
++        assert!(String::from_utf8_lossy(&output.stderr).contains("--target"));
++        assert_eq!(fs::read_to_string(&settings).unwrap(), "{\"hooks\":{}}");
++        assert_eq!(fs::read(home.join(".gitconfig")).ok(), gitconfig_before);
++    }
++}

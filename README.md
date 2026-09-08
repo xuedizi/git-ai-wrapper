@@ -14,7 +14,7 @@ For example, `v1.7.0-tac.v0.2.0` is built from
 
 ## Downstream scope
 
-The wrapper intentionally carries two active downstream patches:
+The wrapper intentionally carries three active downstream patches:
 
 - `codebuddy-preset.patch` adds first-class CodeBuddy support. CodeBuddy's
   hook protocol is compatible with Claude Code, but its transcript stores the
@@ -26,11 +26,15 @@ The wrapper intentionally carries two active downstream patches:
 
 - `enterprise-metrics.patch` adds opt-in checkpoint/commit enterprise telemetry with publisher-embedded configuration and automatic Git email/remote identity:
   transactional inbox/outbox, allowlisted DTOs, independently acknowledged
-  destinations, retry/backoff, and daemon control commands. See
+  destinations, retry/backoff, and daemon control commands. HTTPS uses Native TLS
+  and the platform trust store, with a local HTTPS panic regression. See
   [enterprise telemetry setup](docs/enterprise-metrics.md).
 
+- `install-hooks-target.patch` adds `--target` to native hook installation. See
+  [targeted installation](docs/install-hooks-target.md).
+
 General git-ai attribution, blame, stats, and Git-Notes behavior remains
-upstream `git-ai` 1.7.0. CodeBuddy integration and enterprise delivery are maintained as separate patches. TCLI owns orchestration and invokes:
+upstream `git-ai` 1.7.0. CodeBuddy integration, enterprise delivery, and targeted hook installation are maintained as separate patches. TCLI owns orchestration and invokes:
 
 ```bash
 git ai install-hooks
@@ -43,6 +47,7 @@ git ai stats --json
 patches/GIT_AI_VERSION        upstream git-ai-project/git-ai tag
 patches/codebuddy-preset.patch
 patches/enterprise-metrics.patch
+patches/install-hooks-target.patch
 config/enterprise-metrics.release.json  fixed publisher settings (enabled by default)
 disabled-patches/             inactive source archives (none currently)
 scripts/build-git-ai.sh       clone, patch, and cargo-build git-ai / git-ai.exe

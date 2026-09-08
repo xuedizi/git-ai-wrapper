@@ -2171,12 +2171,13 @@ index 000000000..67d32ff1f
 +}
 diff --git a/src/enterprise_metrics/transport.rs b/src/enterprise_metrics/transport.rs
 new file mode 100644
-index 000000000..42925685a
+index 000000000..7bbd1a265
 --- /dev/null
 +++ b/src/enterprise_metrics/transport.rs
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,122 @@
 +//! Reusable HTTP mechanics; no event types, vendor envelope or ACK policy.
 +use std::{sync::OnceLock, time::Duration};
++use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 +pub struct Response {
 +    pub status: u16,
 +    pub retry_after: Option<String>,
@@ -2204,6 +2205,13 @@ index 000000000..42925685a
 +        static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 +        let agent = AGENT.get_or_init(|| {
 +            ureq::Agent::config_builder()
++                // Match the enabled ureq feature and the rest of git-ai's HTTP clients.
++                .tls_config(
++                    TlsConfig::builder()
++                        .provider(TlsProvider::NativeTls)
++                        .root_certs(RootCerts::PlatformVerifier)
++                        .build(),
++                )
 +                .http_status_as_error(false)
 +                .max_redirects(0)
 +                .max_redirects_will_error(false)
@@ -2235,6 +2243,58 @@ index 000000000..42925685a
 +            retry_after,
 +            body,
 +        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::net::TcpListener;
++    use std::time::Instant;
++
++    #[test]
++    fn https_transport_returns_error_instead_of_panicking() {
++        // An actual local TCP connection reaches TLS setup, without requiring
++        // public network access, service credentials, or a trusted certificate.
++        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++        let address = listener.local_addr().unwrap();
++        listener.set_nonblocking(true).unwrap();
++        let server = std::thread::spawn(move || {
++            let deadline = Instant::now() + Duration::from_secs(2);
++            while Instant::now() < deadline {
++                match listener.accept() {
++                    Ok((stream, _)) => {
++                        drop(stream);
++                        return true;
++                    }
++                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
++                        std::thread::sleep(Duration::from_millis(10));
++                    }
++                    Err(error) => panic!("accept: {error}"),
++                }
++            }
++            false
++        });
++        let result = std::panic::catch_unwind(|| {
++            UreqTransport.post_json(
++                &format!("https://{address}/events"),
++                "Authorization",
++                "test-only",
++                "{}",
++            )
++        });
++        assert!(
++            server.join().unwrap(),
++            "request did not reach the loopback server; ensure NO_PROXY includes 127.0.0.1"
++        );
++        assert!(
++            result.is_ok(),
++            "HTTPS transport panicked instead of returning an error"
++        );
++        assert!(
++            result.unwrap().is_err(),
++            "incomplete TLS handshake must not be accepted"
++        );
 +    }
 +}
 diff --git a/src/enterprise_metrics/worker.rs b/src/enterprise_metrics/worker.rs
