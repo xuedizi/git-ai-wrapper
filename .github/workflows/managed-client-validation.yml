@@ -1,6 +1,15 @@
 name: managed client validation
 
 on:
+  workflow_call:
+    inputs:
+      ga_run_id:
+        description: "Numeric run ID of the GA build whose native artifacts will be tested"
+        type: string
+        required: true
+    secrets:
+      TCLI_VALIDATION_KEY:
+        required: true
   workflow_dispatch:
     inputs:
       ga_run_id:

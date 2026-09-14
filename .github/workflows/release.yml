@@ -9,6 +9,11 @@ on:
       version:
         description: "Release version, for example v1.7.0-tac.v0.1.0"
         required: true
+      client_validation_run_id:
+        description: "Optional GA build run ID; when set, run only private managed client validation"
+        type: string
+        default: ""
+        required: false
       publish:
         description: "Publish only after the full native validation matrix succeeds"
         type: boolean
@@ -19,7 +24,18 @@ permissions:
   contents: write
 
 jobs:
+  managed-client-validation:
+    if: github.event_name == 'workflow_dispatch' && inputs.client_validation_run_id != ''
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/managed-client-validation.yml
+    with:
+      ga_run_id: ${{ inputs.client_validation_run_id }}
+    secrets: inherit
+
   patch-tests:
+    if: github.event_name != 'workflow_dispatch' || inputs.client_validation_run_id == ''
     name: verify downstream patches
     runs-on: ubuntu-24.04
     steps:
@@ -33,6 +49,7 @@ jobs:
         run: scripts/test-patched-git-ai.sh
 
   build:
+    if: github.event_name != 'workflow_dispatch' || inputs.client_validation_run_id == ''
     name: build ${{ matrix.platform }}
     needs: patch-tests
     runs-on: ${{ matrix.runner }}
@@ -135,7 +152,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.event_name == 'push' || inputs.publish == true
+    if: (github.event_name != 'workflow_dispatch' || inputs.client_validation_run_id == '') && (github.event_name == 'push' || inputs.publish == true)
     name: publish GitHub Release
     runs-on: ubuntu-latest
     needs: build
