@@ -38,6 +38,7 @@ expected_patch_names=(
 	"codebuddy-preset.patch"
 	"enterprise-metrics.patch"
 	"install-hooks-target.patch"
+	"tcli-auto-update.patch"
 )
 actual_patch_names=$(printf '%s\n' "${active_patch_names[@]}")
 expected_patch_names_text=$(printf '%s\n' "${expected_patch_names[@]}")

@@ -1,0 +1,303 @@
+diff --git a/src/commands/upgrade.rs b/src/commands/upgrade.rs
+index 1cbde58..1a76b3f 100644
+--- a/src/commands/upgrade.rs
++++ b/src/commands/upgrade.rs
+@@ -645,6 +645,12 @@ fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(
+ }
+ 
+ pub fn run_with_args(args: &[String]) {
++    if crate::tcli_auto_update::is_managed() {
++        if !args.iter().any(|arg| arg == "--background") {
++            eprintln!("This git-ai is bundled with TCLI; use tcli self-update.");
++        }
++        return;
++    }
+     #[cfg(windows)]
+     exit_if_invoked_via_git_extension();
+ 
+@@ -842,6 +848,9 @@ fn print_cached_notice(cache: &UpdateCache) {
+ }
+ 
+ pub fn maybe_schedule_background_update_check() {
++    if crate::tcli_auto_update::is_managed() {
++        return;
++    }
+     let config = config::Config::get();
+     if config.version_checks_disabled() {
+         return;
+@@ -902,6 +911,9 @@ pub enum DaemonUpdateCheckResult {
+ /// Returns `Ok(UpdateReady)` if the install script ran, `Ok(NoUpdate)` if
+ /// no pending update was found or updates are disabled.
+ pub fn check_and_install_update_if_available() -> Result<DaemonUpdateCheckResult, String> {
++    if crate::tcli_auto_update::is_managed() {
++        return Ok(DaemonUpdateCheckResult::NoUpdate);
++    }
+     let config = config::Config::fresh();
+     if config.version_checks_disabled() || config.auto_updates_disabled() {
+         return Ok(DaemonUpdateCheckResult::NoUpdate);
+@@ -975,6 +987,9 @@ pub fn check_and_install_update_if_available() -> Result<DaemonUpdateCheckResult
+ /// and updates the local cache. Returns `DaemonUpdateCheckResult::UpdateReady` when
+ /// the channel has a newer version than the running binary.
+ pub fn check_for_update_available() -> Result<DaemonUpdateCheckResult, String> {
++    if crate::tcli_auto_update::is_managed() {
++        return Ok(DaemonUpdateCheckResult::NoUpdate);
++    }
+     let config = config::Config::fresh();
+     if config.version_checks_disabled() {
+         return Ok(DaemonUpdateCheckResult::NoUpdate);
+diff --git a/src/daemon.rs b/src/daemon.rs
+index f932637..75f823e 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -9110,6 +9110,7 @@ fn daemon_update_check_loop(coordinator: Arc<ActorDaemonCoordinator>, started_at
+     use crate::commands::upgrade::{DaemonUpdateCheckResult, check_for_update_available};
+ 
+     let interval = daemon_update_check_interval().max(1);
++    let mut tcli = crate::tcli_auto_update::Scheduler::new();
+ 
+     loop {
+         {
+@@ -9120,9 +9121,12 @@ fn daemon_update_check_loop(coordinator: Arc<ActorDaemonCoordinator>, started_at
+             if coordinator.is_shutting_down() {
+                 return;
+             }
+-            let _ = coordinator
+-                .shutdown_condvar
+-                .wait_timeout(guard, std::time::Duration::from_secs(interval));
++            let _ = coordinator.shutdown_condvar.wait_timeout(
++                guard,
++                tcli.as_ref()
++                    .map(|s| s.remaining())
++                    .unwrap_or(Duration::from_secs(interval)),
++            );
+         }
+ 
+         if coordinator.is_shutting_down() {
+@@ -9131,6 +9135,10 @@ fn daemon_update_check_loop(coordinator: Arc<ActorDaemonCoordinator>, started_at
+ 
+         coordinator.gc_stale_family_state();
+ 
++        if let Some(scheduler) = &mut tcli {
++            scheduler.tick();
++        }
++
+         match check_for_update_available() {
+             Ok(DaemonUpdateCheckResult::UpdateReady) => {
+                 let (outstanding_checkpoints, retained_checkpoint_bytes) =
+diff --git a/src/lib.rs b/src/lib.rs
+index 5d4b950..060bfa5 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -27,3 +27,5 @@ pub mod tokio_runtime;
+ pub mod utils;
+ pub mod uuid;
+ pub mod wltrace;
++
++pub(crate) mod tcli_auto_update;
+diff --git a/src/tcli_auto_update.rs b/src/tcli_auto_update.rs
+new file mode 100644
+index 0000000..0c1a428
+--- /dev/null
++++ b/src/tcli_auto_update.rs
+@@ -0,0 +1,201 @@
++//! TCLI owns updates only for its bundled `.tcli/git-ai` installation.
++use std::ffi::OsStr;
++use std::path::{Path, PathBuf};
++use std::process::{Child, Command, Stdio};
++use std::sync::OnceLock;
++use std::time::{Duration, Instant};
++
++fn paired_tcli(executable: &Path) -> Option<PathBuf> {
++    let name = match executable.file_name()?.to_str()? {
++        "git-ai" => "tcli",
++        "git-ai.exe" => "tcli.exe",
++        _ => return None,
++    };
++    let sidecars = executable.parent()?;
++    (sidecars.file_name()? == ".tcli").then(|| sidecars.parent().map(|p| p.join(name)))?
++}
++
++fn installation() -> Option<&'static PathBuf> {
++    static TCLI: OnceLock<Option<PathBuf>> = OnceLock::new();
++    TCLI.get_or_init(|| std::env::current_exe().ok().and_then(|p| paired_tcli(&p)))
++        .as_ref()
++}
++
++pub(crate) fn is_managed() -> bool {
++    // Do not fall back to upstream downloads if the paired TCLI is temporarily absent.
++    installation().is_some()
++}
++
++fn enabled(value: Option<&OsStr>) -> bool {
++    value != Some(OsStr::new("0"))
++}
++
++fn next_check(now: Instant, startup: bool) -> Instant {
++    now + Duration::from_secs(if startup {
++        rand::random_range(60..=300)
++    } else {
++        3600
++    })
++}
++
++pub(crate) struct Scheduler {
++    executable: PathBuf,
++    next: Instant,
++    child: Option<Child>,
++}
++
++impl Scheduler {
++    pub(crate) fn new() -> Option<Self> {
++        let executable = installation()?.clone();
++        enabled(std::env::var_os("TCLI_AUTO_UPDATE").as_deref()).then(|| Self {
++            executable,
++            next: next_check(Instant::now(), true),
++            child: None,
++        })
++    }
++
++    pub(crate) fn remaining(&self) -> Duration {
++        self.next.saturating_duration_since(Instant::now())
++    }
++
++    pub(crate) fn tick(&mut self) {
++        let now = Instant::now();
++        if now < self.next {
++            return;
++        }
++        self.next = next_check(now, false);
++        if let Some(child) = &mut self.child {
++            match child.try_wait() {
++                Ok(None) => return,
++                Ok(Some(_)) => self.child = None,
++                Err(err) => {
++                    tracing::warn!(%err, "could not reap TCLI automatic update check");
++                    return;
++                }
++            }
++        }
++        let mut command = Command::new(&self.executable);
++        command
++            .args(["self-update", "--auto"])
++            .stdin(Stdio::null())
++            .stdout(Stdio::null())
++            .stderr(Stdio::null());
++        #[cfg(windows)]
++        {
++            use std::os::windows::process::CommandExt;
++            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
++        }
++        match command.spawn() {
++            Ok(child) => self.child = Some(child),
++            Err(err) => tracing::warn!(%err, "could not start paired TCLI automatic update check"),
++        }
++        // Never wait here: the updater may request this daemon's shutdown.
++        // Dropping Child on shutdown leaves the independent updater running.
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn managed_layout_uses_paired_tcli() {
++        let root = std::env::temp_dir().join("tcli layout");
++        assert_eq!(
++            paired_tcli(&root.join(".tcli/git-ai")),
++            Some(root.join("tcli"))
++        );
++        assert_eq!(
++            paired_tcli(&root.join(".tcli/git-ai.exe")),
++            Some(root.join("tcli.exe"))
++        );
++    }
++
++    #[test]
++    fn standalone_layout_does_not_trigger_tcli() {
++        for path in ["/usr/local/bin/git-ai", "/tmp/.tcli/another", "/tmp/git-ai"] {
++            assert_eq!(paired_tcli(Path::new(path)), None);
++        }
++    }
++
++    #[test]
++    fn startup_is_jittered_and_retries_are_one_hour() {
++        let now = Instant::now();
++        for _ in 0..50 {
++            let delay = next_check(now, true).duration_since(now);
++            assert!((Duration::from_secs(60)..=Duration::from_secs(300)).contains(&delay));
++        }
++        assert_eq!(
++            next_check(now, false).duration_since(now),
++            Duration::from_secs(3600)
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn tick_spawns_silently_without_waiting_and_skips_early_or_overlapping_checks() {
++        use std::os::unix::fs::PermissionsExt;
++        let root = tempfile::tempdir().unwrap();
++        let executable = root.path().join("paired tcli");
++        std::fs::write(
++            &executable,
++            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nsleep 0.2\n",
++        )
++        .unwrap();
++        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
++        let mut scheduler = Scheduler {
++            executable: executable.clone(),
++            next: next_check(Instant::now(), true),
++            child: None,
++        };
++        scheduler.tick();
++        assert!(
++            scheduler.child.is_none(),
++            "startup must wait for its deadline"
++        );
++        scheduler.next = Instant::now();
++        scheduler.tick();
++        let pid = scheduler.child.as_ref().unwrap().id();
++        scheduler.next = Instant::now();
++        scheduler.tick();
++        assert_eq!(
++            scheduler.child.as_ref().unwrap().id(),
++            pid,
++            "do not overlap a running check"
++        );
++        let deadline = Instant::now() + Duration::from_secs(5);
++        while scheduler
++            .child
++            .as_mut()
++            .unwrap()
++            .try_wait()
++            .unwrap()
++            .is_none()
++        {
++            if Instant::now() >= deadline {
++                let child = scheduler.child.as_mut().unwrap();
++                let _ = child.kill();
++                let _ = child.wait();
++                panic!("synthetic TCLI did not exit within five seconds");
++            }
++            std::thread::sleep(Duration::from_millis(10));
++        }
++        assert_eq!(
++            std::fs::read_to_string(executable.with_file_name("paired tcli.args")).unwrap(),
++            "self-update\n--auto\n"
++        );
++        scheduler.tick();
++        assert_eq!(
++            scheduler.child.as_ref().unwrap().id(),
++            pid,
++            "completed check must still honor the next deadline"
++        );
++    }
++
++    #[test]
++    fn explicit_zero_disables_automatic_trigger() {
++        assert!(enabled(None));
++        assert!(enabled(Some(std::ffi::OsStr::new("1"))));
++        assert!(!enabled(Some(std::ffi::OsStr::new("0"))));
++    }
++}

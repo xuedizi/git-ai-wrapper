@@ -42,3 +42,10 @@ Inactive diagnostic or recovery patches, if any, are documented in
   all Skills, and survives dry-run apply suggestions. Targeted uninstall is
   explicitly rejected. Includes parser and isolated TestRepo regressions.
   See [parameter contract](../docs/install-hooks-target.md).
+
+- `tcli-auto-update.patch` detects the TCLI `.tcli/git-ai[.exe]` layout and invokes
+  the paired `tcli self-update --auto` after a randomized 60–300 second startup
+  delay, then every hour. TCLI owns network caching (24 hours after success,
+  15 minutes after failure). `TCLI_AUTO_UPDATE=0` disables the trigger. Bundled GA
+  does not download independent upstream updates; standalone GA is unchanged.
+  The patch adds no maintenance protocol or persistent update state.
