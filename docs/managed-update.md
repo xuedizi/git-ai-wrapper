@@ -119,6 +119,16 @@ short commands between inspections cannot be counted as continuous idle.
 
 ## Validation record and remaining platform gates
 
+Production dependency coverage is checked before test targets: the patch gate
+runs `TCLI_MANAGED_GIT_AI=1 cargo check --locked --release --bin git-ai` without
+`test-support`. CI run 34823080689 exposed an omitted production `tempfile`
+dependency despite passing test builds. The snapshot validator now declares it
+as a normal dependency, and `test-support` remains a marker feature. Native
+release builds must still compile and exercise the actual release executable.
+The dependency fix passed a local macOS arm64 `cargo build --locked --release
+--bin git-ai` without `test-support`; the resulting binary returned managed
+protocol 1 identity successfully.
+
 The runtime-binding test first failed against the previous binary with
 `inspect missed installation binding`. The live lifecycle test also caught
 normal SQLite WAL residue before the snapshot validator was added; the WAL test

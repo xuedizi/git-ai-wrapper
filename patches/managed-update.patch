@@ -1,8 +1,16 @@
 diff --git a/Cargo.toml b/Cargo.toml
-index 2fb80af..327ca75 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -46,7 +46,7 @@ openssl = { version = "0.10", features = ["vendored"] }
+@@ -38,7 +38,7 @@
+ regex = "1.12"
+ toml = "0.9"
+ unicode-normalization = "0.1"
+-tempfile = { version = "3.27", optional = true }
++tempfile = "3.27"
+ 
+ [target.'cfg(target_os = "linux")'.dependencies]
+ openssl = { version = "0.10", features = ["vendored"] }
+@@ -46,10 +46,10 @@
  [target.'cfg(windows)'.dependencies]
  named_pipe = "0.4.1"
  winreg = "0.55"
@@ -10,7 +18,11 @@ index 2fb80af..327ca75 100644
 +windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Environment", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_SystemServices", "Win32_Storage_FileSystem"] }
  
  [features]
- test-support = ["dep:tempfile"]
+-test-support = ["dep:tempfile"]
++test-support = []
+ keyring = ["dep:keyring"]
+ 
+ [dev-dependencies]
 diff --git a/src/authorship/internal_db.rs b/src/authorship/internal_db.rs
 index 4fce5e1..dc9872f 100644
 --- a/src/authorship/internal_db.rs

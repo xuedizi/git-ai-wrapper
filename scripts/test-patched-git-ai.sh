@@ -64,6 +64,11 @@ for patch_file in "${active_patch_files[@]}"; do
 	(cd "$WORK/src" && git apply "$patch_file")
 done
 
+# Check the production feature graph before test/dev dependencies are unified.
+# Snapshot health uses tempfile in production; test-support must not hide omissions.
+echo ">> checking production release target without test-support"
+(cd "$WORK/src" && TCLI_MANAGED_GIT_AI=1 cargo check --locked --release --bin git-ai)
+
 # Existing TestRepo fixtures intentionally reuse one executable across many homes.
 # Exercise standalone behavior for those fixtures; managed lifecycle tests copy
 # a separate installation per home and enable the managed build explicitly.
