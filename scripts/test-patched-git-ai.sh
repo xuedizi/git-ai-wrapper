@@ -38,6 +38,7 @@ expected_patch_names=(
 	"codebuddy-preset.patch"
 	"enterprise-metrics.patch"
 	"install-hooks-target.patch"
+	"tcli-auto-update.patch"
 )
 actual_patch_names=$(printf '%s\n' "${active_patch_names[@]}")
 expected_patch_names_text=$(printf '%s\n' "${expected_patch_names[@]}")
@@ -73,3 +74,5 @@ echo ">> running patched upstream tests (cargo test)"
 (cd "$WORK/src" && cargo test --locked --test integration test_edge_extension_recovery_metric_copies_source_session_tool_and_model)
 
 (cd "$WORK/src" && cargo test --locked --test integration install_hooks_target)
+
+(cd "$WORK/src" && cargo test --locked --test integration codebuddy_cwd)

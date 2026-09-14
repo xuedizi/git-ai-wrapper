@@ -14,7 +14,7 @@ For example, `v1.7.0-tac.v0.2.0` is built from
 
 ## Downstream scope
 
-The wrapper intentionally carries three active downstream patches:
+The wrapper intentionally carries four active downstream patches:
 
 - `codebuddy-preset.patch` adds first-class CodeBuddy support. CodeBuddy's
   hook protocol is compatible with Claude Code, but its transcript stores the
@@ -23,6 +23,8 @@ The wrapper intentionally carries three active downstream patches:
   stream format with a dedicated model extractor, a `Codebuddy` tool classifier,
   and a `CodebuddyInstaller` that writes hooks into `~/.codebuddy/settings.json`.
   Subagent-parent detection is intentionally deferred to a later version.
+  Invalid event working directories fall back to the hook process directory,
+  preserving valid CLI event directories; see [CLI/IDE cwd compatibility](docs/codebuddy-cwd.md).
 
 - `enterprise-metrics.patch` adds opt-in checkpoint/commit enterprise telemetry with publisher-embedded configuration and automatic Git email/remote identity:
   transactional inbox/outbox, allowlisted DTOs, independently acknowledged
@@ -30,6 +32,8 @@ The wrapper intentionally carries three active downstream patches:
   and the platform trust store, with a local HTTPS panic regression. See
   [enterprise telemetry setup](docs/enterprise-metrics.md).
 
+- `tcli-auto-update.patch` lets a TCLI-bundled daemon periodically invoke its paired
+  `tcli self-update --auto`; standalone git-ai keeps its upstream update behavior.
 - `install-hooks-target.patch` adds `--target` to native hook installation. See
   [targeted installation](docs/install-hooks-target.md).
 
@@ -48,6 +52,7 @@ patches/GIT_AI_VERSION        upstream git-ai-project/git-ai tag
 patches/codebuddy-preset.patch
 patches/enterprise-metrics.patch
 patches/install-hooks-target.patch
+patches/tcli-auto-update.patch
 config/enterprise-metrics.release.json  fixed publisher settings (enabled by default)
 disabled-patches/             inactive source archives (none currently)
 scripts/build-git-ai.sh       clone, patch, and cargo-build git-ai / git-ai.exe
@@ -94,8 +99,9 @@ platform:
 | `windows/amd64` | `windows-2025` | `git-ai.exe` |
 | `windows/arm64` | `windows-11-arm` | `git-ai.exe` |
 
-The `patch-tests` job applies both active patches to a clean pinned checkout and
-runs the library suite and enterprise TestRepo integration test before any native release build starts.
+The `patch-tests` job applies all four active patches to a clean pinned checkout and
+runs the library suite (including TCLI layout and timer tests), enterprise/installer
+regressions, and CodeBuddy cwd tests before native release builds.
 
 Remove the CodeBuddy patch only after a released upstream tag contains both the
 source behavior and equivalent regression coverage. Rollback must restore the
