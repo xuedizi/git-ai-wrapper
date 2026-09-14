@@ -1,0 +1,23 @@
+{
+  "source_digest": "b1074d4152ffa5a478084e45d42a9de5c4288a3ba4d59c74d883bad2e3301cc2",
+  "bundles": {
+    "linux-amd64": {
+      "sha256": "e77d952e20536a5b04af945f621f9885b6bfe045eafab5ba5a29436371eb3a40"
+    },
+    "linux-arm64": {
+      "sha256": "009eb6ab2806e44cd0de25b0f2f6c102de29546b0244dcac331e43b2d5882d24"
+    },
+    "darwin-amd64": {
+      "sha256": "344a5609b513be6386256abb9d9ca8803ac7c5542fea552ca9a795b325b6e23f"
+    },
+    "darwin-arm64": {
+      "sha256": "ab18d871a30ad8dc15057a76d4273fac235daf249b02e126c2b485274b89639e"
+    },
+    "windows-amd64": {
+      "sha256": "97f4aa13e22b19b81ef439f3570d0a9221815ef84c9abacb2ace89030fc73a5c"
+    },
+    "windows-arm64": {
+      "sha256": "bc3c1d3cf7cdc78f7191a12336055e0a0119b69b716efc78666aeb95510ff4d1"
+    }
+  }
+}

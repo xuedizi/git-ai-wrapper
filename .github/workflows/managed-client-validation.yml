@@ -1,0 +1,126 @@
+name: managed client validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      ga_run_id:
+        description: "Numeric run ID of the GA build whose native artifacts will be tested"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  validate:
+    name: managed clients ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            runner_arch: X64
+            artifact: git-ai-linux-amd64
+            bundle: linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            runner_arch: ARM64
+            artifact: git-ai-linux-arm64
+            bundle: linux-arm64
+          - platform: darwin/amd64
+            runner: macos-15-intel
+            runner_arch: X64
+            artifact: git-ai-darwin-amd64
+            bundle: darwin-amd64
+          - platform: darwin/arm64
+            runner: macos-15
+            runner_arch: ARM64
+            artifact: git-ai-darwin-arm64
+            bundle: darwin-arm64
+          - platform: windows/amd64
+            runner: windows-2025
+            runner_arch: X64
+            artifact: git-ai-windows-amd64
+            bundle: windows-amd64
+          - platform: windows/arm64
+            runner: windows-11-arm
+            runner_arch: ARM64
+            artifact: git-ai-windows-arm64
+            bundle: windows-arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate requested run and native runner
+        shell: bash
+        env:
+          GA_RUN_ID: ${{ inputs.ga_run_id }}
+          EXPECTED_ARCH: ${{ matrix.runner_arch }}
+          VALIDATION_PLATFORM: ${{ matrix.platform }}
+        run: |
+          python - <<'PY'
+          import os, re
+          if not re.fullmatch(r"[1-9][0-9]*", os.environ["GA_RUN_ID"]):
+              raise SystemExit("ga_run_id must be a positive numeric string")
+          if os.environ["RUNNER_ARCH"] != os.environ["EXPECTED_ARCH"]:
+              raise SystemExit("native runner architecture mismatch")
+          print("ARCH_EVIDENCE platform=" + os.environ["VALIDATION_PLATFORM"] + " runner=" + os.environ["RUNNER_ARCH"])
+          PY
+      - name: Download selected GA build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/managed-ga-artifacts
+          run-id: ${{ inputs.ga_run_id }}
+          github-token: ${{ github.token }}
+      - name: Install Go for Windows synthetic fixtures
+        if: startsWith(matrix.platform, 'windows/')
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: false
+      - name: Decrypt private validation bundle into runner temporary storage
+        shell: bash
+        env:
+          TCLI_VALIDATION_KEY: ${{ secrets.TCLI_VALIDATION_KEY }}
+          VALIDATION_BUNDLE: ${{ matrix.bundle }}
+        run: |
+          python - <<'PY'
+          import os, pathlib, subprocess
+          if not os.environ.get("TCLI_VALIDATION_KEY"):
+              raise SystemExit("TCLI_VALIDATION_KEY is required")
+          encrypted = pathlib.Path(".ci/tcli-validation") / (os.environ["VALIDATION_BUNDLE"] + ".zip.enc")
+          decrypted = pathlib.Path(os.environ["RUNNER_TEMP"]) / "managed-client-bundle.zip"
+          subprocess.run(["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-iter", "200000",
+                          "-md", "sha256", "-pass", "env:TCLI_VALIDATION_KEY", "-in", str(encrypted),
+                          "-out", str(decrypted)], check=True)
+          PY
+      - name: Verify bundle and run native managed client tests
+        shell: bash
+        env:
+          VALIDATION_PLATFORM: ${{ matrix.platform }}
+        run: |
+          python - <<'PY'
+          import os, pathlib, subprocess, sys
+          temporary = pathlib.Path(os.environ["RUNNER_TEMP"])
+          subprocess.run([sys.executable, "scripts/run-managed-client-validation.py",
+                          "--platform", os.environ["VALIDATION_PLATFORM"],
+                          "--ga-dir", str(temporary / "managed-ga-artifacts"),
+                          "--bundle", str(temporary / "managed-client-bundle.zip")], check=True)
+          PY
+      - name: Remove decrypted bundle
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, pathlib, shutil
+          temporary = pathlib.Path(os.environ["RUNNER_TEMP"])
+          (temporary / "managed-client-bundle.zip").unlink(missing_ok=True)
+          for path in temporary.glob("managed-client-*"):
+              if path.is_dir():
+                  shutil.rmtree(path)
+          PY
