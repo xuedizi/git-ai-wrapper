@@ -1,0 +1,2549 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 2fb80af..327ca75 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -46,7 +46,7 @@ openssl = { version = "0.10", features = ["vendored"] }
+ [target.'cfg(windows)'.dependencies]
+ named_pipe = "0.4.1"
+ winreg = "0.55"
+-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Environment", "Win32_UI_WindowsAndMessaging"] }
++windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Environment", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_SystemServices", "Win32_Storage_FileSystem"] }
+ 
+ [features]
+ test-support = ["dep:tempfile"]
+diff --git a/src/authorship/internal_db.rs b/src/authorship/internal_db.rs
+index 4fce5e1..dc9872f 100644
+--- a/src/authorship/internal_db.rs
++++ b/src/authorship/internal_db.rs
+@@ -106,6 +106,7 @@ impl InternalDatabase {
+             match Self::new() {
+                 Ok(db) => Mutex::new(db),
+                 Err(e) => {
++                    crate::managed_update::record_data_failure();
+                     // Log error during initialization
+                     eprintln!("[Error] Failed to initialize internal database: {}", e);
+                     crate::observability::log_error(
+@@ -175,7 +176,7 @@ impl InternalDatabase {
+     /// In test mode, can be overridden via GIT_AI_TEST_DB_PATH environment variable.
+     /// We also support GITAI_TEST_DB_PATH because some git hook execution paths
+     /// may scrub custom GIT_* variables.
+-    fn database_path() -> Result<PathBuf, GitAiError> {
++    pub(crate) fn database_path() -> Result<PathBuf, GitAiError> {
+         // Allow test override via environment variable
+         #[cfg(any(test, feature = "test-support"))]
+         if let Ok(test_path) =
+diff --git a/src/commands/daemon.rs b/src/commands/daemon.rs
+index bdbfc87..d5e5939 100644
+--- a/src/commands/daemon.rs
++++ b/src/commands/daemon.rs
+@@ -23,6 +23,19 @@ pub fn handle_daemon(args: &[String]) {
+         std::process::exit(0);
+     }
+ 
++    let _foreground = if !matches!(args[0].as_str(), "run" | "status" | "tail") {
++        match daemon_config_from_env_or_default_paths().and_then(|config| {
++            crate::managed_update::foreground(&config).map_err(|e| e.to_string())
++        }) {
++            Ok(lease) => lease,
++            Err(e) => {
++                eprintln!("{e}");
++                std::process::exit(75);
++            }
++        }
++    } else {
++        None
++    };
+     match args[0].as_str() {
+         "start" => {
+             if let Err(e) = handle_start(&args[1..]) {
+@@ -194,7 +207,15 @@ fn handle_run(args: &[String]) -> Result<(), String> {
+     let runtime = crate::tokio_runtime::build_daemon_runtime()?;
+     crate::tokio_runtime::initialize();
+     let exit_action = runtime
+-        .block_on(async move { crate::daemon::run_daemon(config).await })
++        .block_on(async move {
++            crate::daemon::run_daemon_with_transaction(
++                config,
++                args.windows(2)
++                    .find(|p| p[0] == "--managed-transaction")
++                    .map(|p| p[1].clone()),
++            )
++            .await
++        })
+         .map_err(|e| e.to_string())?;
+ 
+     match exit_action {
+@@ -228,6 +249,7 @@ pub(crate) fn ensure_daemon_running(
+     #[cfg_attr(any(test, feature = "test-support"), allow(unused))] timeout: Duration,
+ ) -> Result<DaemonConfig, String> {
+     let config = daemon_config_from_env_or_default_paths()?;
++    let _lease = crate::managed_update::foreground(&config).map_err(|e| e.to_string())?;
+     if daemon_is_up(&config) {
+         return Ok(config);
+     }
+@@ -351,6 +373,37 @@ fn powershell_single_quote_literal(value: &OsStr) -> String {
+     format!("'{}'", value.to_string_lossy().replace('\'', "''"))
+ }
+ 
++pub(crate) fn spawn_managed_validation(
++    config: &DaemonConfig,
++    transaction: &str,
++) -> Result<(), String> {
++    let exe = crate::managed_update::installation().map_err(|e| e.to_string())?;
++    let mut command = Command::new(exe);
++    command
++        .args(["bg", "run", "--managed-transaction", transaction])
++        .env(
++            "GIT_AI_DAEMON_HOME",
++            config
++                .internal_dir
++                .ancestors()
++                .nth(2)
++                .ok_or("daemon home has no parent")?,
++        )
++        .env("GIT_AI_DAEMON_CONTROL_SOCKET", &config.control_socket_path)
++        .env("GIT_AI_DAEMON_TRACE_SOCKET", &config.trace_socket_path)
++        .stdin(Stdio::null())
++        .stdout(Stdio::null())
++        .stderr(Stdio::null());
++    #[cfg(windows)]
++    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
++    command
++        .spawn()
++        .map(|mut child| {
++            let _ = std::thread::spawn(move || child.wait());
++        })
++        .map_err(|e| e.to_string())
++}
++
+ #[cfg(any(windows, not(any(test, feature = "test-support"))))]
+ fn spawn_daemon_run_detached(config: &DaemonConfig) -> Result<(), String> {
+     // Use current_git_ai_exe() instead of current_exe() to resolve through
+@@ -718,6 +771,7 @@ fn wait_for_process_exit(_pid: u32, _timeout: Duration) {
+ /// Used by internal callers (install-hooks, upgrade) that need the daemon stopped
+ /// before proceeding.
+ pub(crate) fn stop_daemon(config: &DaemonConfig, timeout: Duration) -> Result<(), String> {
++    let _lease = crate::managed_update::foreground(config).map_err(|e| e.to_string())?;
+     // Nothing to do if daemon isn't running.
+     if !daemon_is_up(config) && !daemon_startup_is_blocked(config) {
+         return Ok(());
+@@ -753,6 +807,7 @@ pub(crate) fn stop_daemon(config: &DaemonConfig, timeout: Duration) -> Result<()
+ /// Shut down the running daemon and start a fresh one. Escalates to hard kill
+ /// if the soft shutdown doesn't complete within GRACEFUL_SHUTDOWN_TIMEOUT.
+ pub(crate) fn restart_daemon(config: &DaemonConfig) -> Result<(), String> {
++    let _lease = crate::managed_update::foreground(config).map_err(|e| e.to_string())?;
+     let was_running = daemon_is_up(config) || daemon_startup_is_blocked(config);
+     if was_running {
+         stop_daemon(config, GRACEFUL_SHUTDOWN_TIMEOUT)?;
+diff --git a/src/commands/git_ai_handlers.rs b/src/commands/git_ai_handlers.rs
+index 4e5aaee..f563f2f 100644
+--- a/src/commands/git_ai_handlers.rs
++++ b/src/commands/git_ai_handlers.rs
+@@ -28,6 +28,27 @@ pub fn handle_git_ai(args: &[String]) {
+         return;
+     }
+ 
++    if args[0] == "managed-update" {
++        crate::managed_update::handle(&args[1..]);
++        return;
++    }
++    let _foreground_lease = if !matches!(
++        args[0].as_str(),
++        "--version" | "version" | "-v" | "help" | "--help" | "-h" | "bg" | "d" | "daemon"
++    ) {
++        match crate::daemon::DaemonConfig::from_env_or_default_paths()
++            .and_then(|config| crate::managed_update::foreground(&config))
++        {
++            Ok(lease) => lease,
++            Err(e) => {
++                eprintln!("{e}");
++                std::process::exit(if args[0] == "checkpoint" { 0 } else { 75 });
++            }
++        }
++    } else {
++        None
++    };
++
+     // Initialize the global telemetry handle so that observability and CAS
+     // events are routed over the control socket instead of being written to
+     // per-PID log files.
+diff --git a/src/commands/upgrade.rs b/src/commands/upgrade.rs
+index 1cbde58..f35089d 100644
+--- a/src/commands/upgrade.rs
++++ b/src/commands/upgrade.rs
+@@ -645,6 +645,12 @@ fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(
+ }
+ 
+ pub fn run_with_args(args: &[String]) {
++    if crate::managed_update::managed() {
++        eprintln!(
++            "This git-ai is managed by TCLI. Run tcli self-update to update the complete release."
++        );
++        return;
++    }
+     #[cfg(windows)]
+     exit_if_invoked_via_git_extension();
+ 
+@@ -842,6 +848,9 @@ fn print_cached_notice(cache: &UpdateCache) {
+ }
+ 
+ pub fn maybe_schedule_background_update_check() {
++    if crate::managed_update::managed() {
++        return;
++    }
+     let config = config::Config::get();
+     if config.version_checks_disabled() {
+         return;
+@@ -902,6 +911,9 @@ pub enum DaemonUpdateCheckResult {
+ /// Returns `Ok(UpdateReady)` if the install script ran, `Ok(NoUpdate)` if
+ /// no pending update was found or updates are disabled.
+ pub fn check_and_install_update_if_available() -> Result<DaemonUpdateCheckResult, String> {
++    if crate::managed_update::managed() {
++        return Ok(DaemonUpdateCheckResult::NoUpdate);
++    }
+     let config = config::Config::fresh();
+     if config.version_checks_disabled() || config.auto_updates_disabled() {
+         return Ok(DaemonUpdateCheckResult::NoUpdate);
+@@ -975,6 +987,9 @@ pub fn check_and_install_update_if_available() -> Result<DaemonUpdateCheckResult
+ /// and updates the local cache. Returns `DaemonUpdateCheckResult::UpdateReady` when
+ /// the channel has a newer version than the running binary.
+ pub fn check_for_update_available() -> Result<DaemonUpdateCheckResult, String> {
++    if crate::managed_update::managed() {
++        return Ok(DaemonUpdateCheckResult::NoUpdate);
++    }
+     let config = config::Config::fresh();
+     if config.version_checks_disabled() {
+         return Ok(DaemonUpdateCheckResult::NoUpdate);
+@@ -1825,7 +1840,14 @@ mod tests {
+     fn check_for_update_available_returns_update_ready_when_cache_has_pending_update() {
+         with_update_check_env(true, false, || {
+             let result = check_for_update_available().unwrap();
+-            assert_eq!(result, DaemonUpdateCheckResult::UpdateReady);
++            assert_eq!(
++                result,
++                if crate::managed_update::managed() {
++                    DaemonUpdateCheckResult::NoUpdate
++                } else {
++                    DaemonUpdateCheckResult::UpdateReady
++                }
++            );
+         });
+     }
+ 
+diff --git a/src/daemon.rs b/src/daemon.rs
+index f932637..0502dc5 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -2775,6 +2775,14 @@ pub struct ActorDaemonCoordinator {
+     processed_checkpoint_receipt_seq: AtomicUsize,
+     unadmitted_checkpoints: AtomicUsize,
+     accepting_checkpoints: AtomicBool,
++    managed_config: Option<DaemonConfig>,
++    managed_control_lock: tokio::sync::Mutex<()>,
++    managed_paused: AtomicBool,
++    managed_quiesced: AtomicBool,
++    managed_stop: AtomicBool,
++    managed_trace_readers: AtomicUsize,
++    managed_last_activity: AtomicU64,
++    managed_idle_sample: Mutex<(u64, u64, u64, u128)>,
+     checkpoint_progress_notify: Notify,
+     bash_sessions: Mutex<crate::daemon::bash_sessions::BashSessionState>,
+     test_completion_log_dir: Option<PathBuf>,
+@@ -2902,6 +2910,14 @@ impl ActorDaemonCoordinator {
+             processed_checkpoint_receipt_seq: AtomicUsize::new(0),
+             unadmitted_checkpoints: AtomicUsize::new(0),
+             accepting_checkpoints: AtomicBool::new(true),
++            managed_config: None,
++            managed_control_lock: tokio::sync::Mutex::new(()),
++            managed_paused: AtomicBool::new(false),
++            managed_quiesced: AtomicBool::new(false),
++            managed_stop: AtomicBool::new(false),
++            managed_trace_readers: AtomicUsize::new(0),
++            managed_last_activity: AtomicU64::new(0),
++            managed_idle_sample: Mutex::new((0, 0, 0, now_unix_nanos())),
+             checkpoint_progress_notify: Notify::new(),
+             bash_sessions: Mutex::new(crate::daemon::bash_sessions::BashSessionState::new()),
+             test_completion_log_dir: std::env::var("GIT_AI_TEST_DB_PATH")
+@@ -3688,6 +3704,7 @@ impl ActorDaemonCoordinator {
+         seq: u64,
+         error: &GitAiError,
+     ) -> Result<(), GitAiError> {
++        crate::managed_update::record_data_failure();
+         let mut map = self
+             .side_effect_errors_by_family
+             .lock()
+@@ -7179,9 +7196,206 @@ impl ActorDaemonCoordinator {
+         Ok(())
+     }
+ 
++    fn managed_status(&self) -> Result<Value, GitAiError> {
++        let config = self
++            .managed_config
++            .as_ref()
++            .ok_or_else(|| GitAiError::Generic("daemon is not a managed build".into()))?;
++        let state = crate::managed_update::read(config)?;
++        let busy = self.has_pending_daemon_work()
++            || self.managed_trace_readers.load(Ordering::SeqCst) != 0
++            || crate::managed_update::foreground_in_use(config)?
++            || self
++                .bash_sessions
++                .lock()
++                .map(|s| s.has_active())
++                .unwrap_or(true);
++        let activity = self.managed_last_activity.load(Ordering::Acquire);
++        let checkpoints = self.next_checkpoint_receipt_seq.load(Ordering::Acquire) as u64;
++        let now = now_unix_nanos();
++        let foreground = crate::managed_update::foreground_watermark(config);
++        let mut idle = self
++            .managed_idle_sample
++            .lock()
++            .map_err(|_| GitAiError::Generic("idle state poisoned".into()))?;
++        if busy || idle.0 != activity || idle.1 != checkpoints || idle.2 != foreground {
++            *idle = (activity, checkpoints, foreground, now);
++        }
++        let idle_seconds = now.saturating_sub(idle.3) / 1_000_000_000;
++        let validating = crate::managed_update::VALIDATING.load(Ordering::Acquire);
++        let stream_required = config::Config::get()
++            .get_feature_flags()
++            .transcript_streaming;
++        let token_required = stream_required
++            && config::Config::get()
++                .get_feature_flags()
++                .token_usage_metrics;
++        let ready = self.trace_ingest_tx.get().is_some()
++            && self.checkpoint_ingress_tx.get().is_some()
++            && self.telemetry_worker.is_some()
++            && (!stream_required || self.stream_worker.is_some())
++            && (!token_required || self.token_usage_worker.is_some())
++            && !self.is_shutting_down()
++            && !crate::managed_update::data_failed();
++        Ok(
++            json!({"protocol":1,"wrapper_version":crate::managed_update::wrapper_version(),
++            "transaction":state.as_ref().map(|s|&s.transaction),"running":true,"pid":std::process::id(),
++            "executable":crate::managed_update::installation()?,"daemon_home":config.internal_dir,
++            "busy":busy,"idle_seconds":idle_seconds,"phase":state.as_ref().map(|s|s.phase.as_str()).unwrap_or("normal"),
++            "ready":ready,"quiesced":self.managed_quiesced.load(Ordering::Acquire),
++            "durable":self.managed_quiesced.load(Ordering::Acquire),"validation":validating,
++            "data_schema":1,"data_schema_min":1,"data_schema_max":1,
++            "started_at_ns":fs::read(pid_metadata_path(config)).ok().and_then(|b|serde_json::from_slice::<Value>(&b).ok()).and_then(|v|v.get("started_at_ns").cloned())}),
++        )
++    }
++
++    async fn managed_control(&self, action: &str, transaction: &str) -> Result<Value, GitAiError> {
++        let _control_guard = self.managed_control_lock.lock().await;
++        let config = self
++            .managed_config
++            .as_ref()
++            .ok_or_else(|| GitAiError::Generic("daemon is not managed".into()))?;
++        let mut state = crate::managed_update::owned(config, transaction)?;
++        let failure = |message: &str| GitAiError::Generic(message.into());
++        match action {
++            "prepare" => {
++                if state.phase != "prepared" {
++                    return Err(failure("prepare requires prepared transaction"));
++                }
++                if self.has_open_trace_roots_that_may_mutate_refs()
++                    || self
++                        .bash_sessions
++                        .lock()
++                        .map(|s| s.has_active())
++                        .unwrap_or(true)
++                {
++                    return Err(failure("busy: active Git or AI root sessions"));
++                }
++                self.managed_paused.store(true, Ordering::SeqCst);
++                crate::managed_update::PAUSED.store(true, Ordering::Release);
++                self.set_checkpoint_acceptance(false)?;
++                let drain = async {
++                    while self.managed_trace_readers.load(Ordering::SeqCst) != 0 {
++                        tokio::time::sleep(Duration::from_millis(1)).await;
++                    }
++                    // If a root crossed the close boundary, abort instead of guessing it is idle.
++                    if self.has_open_trace_roots_that_may_mutate_refs() {
++                        return Err(failure("busy: Git root crossed maintenance boundary"));
++                    }
++                    self.drain_accepted_checkpoints().await?;
++                    if let Some(worker) = &self.stream_worker {
++                        worker.drain().await.map_err(GitAiError::Generic)?;
++                    }
++                    if let Some(worker) = &self.token_usage_worker {
++                        worker.drain().await.map_err(GitAiError::Generic)?;
++                    }
++                    crate::managed_update::drain_producers().await;
++                    if let Some(worker) = &self.telemetry_worker {
++                        if !worker
++                            .drain_metrics_persist_queue(Duration::from_secs(10))
++                            .await
++                        {
++                            return Err(failure("local metrics persistence failed or timed out"));
++                        }
++                    } else {
++                        return Err(failure("telemetry persistence worker unavailable"));
++                    }
++                    if crate::daemon::telemetry_worker::metric_batches_dropped() > 0 {
++                        return Err(failure(
++                            "metrics persistence queue previously dropped accepted work",
++                        ));
++                    }
++                    if self.has_pending_daemon_work() {
++                        return Err(failure("busy: accepted daemon work remains"));
++                    }
++                    if crate::managed_update::data_failed() {
++                        return Err(failure(
++                            "accepted work recorded a data error; safe update cannot certify durability",
++                        ));
++                    }
++                    Ok(())
++                };
++                match tokio::time::timeout(Duration::from_secs(30), drain).await {
++                    Ok(Ok(())) => self.managed_quiesced.store(true, Ordering::Release),
++                    result => {
++                        self.set_checkpoint_acceptance(true)?;
++                        self.managed_paused.store(false, Ordering::SeqCst);
++                        crate::managed_update::PAUSED.store(false, Ordering::Release);
++                        return Err(match result {
++                            Ok(Err(e)) => e,
++                            _ => failure(
++                                "managed drain timed out; abort transaction to reopen foreground commands",
++                            ),
++                        });
++                    }
++                }
++            }
++            "abort" => {
++                if state.phase != "prepared" || self.is_shutting_down() {
++                    return Err(failure("cannot abort stopping daemon"));
++                }
++                self.managed_quiesced.store(false, Ordering::Release);
++                self.managed_paused.store(false, Ordering::SeqCst);
++                crate::managed_update::PAUSED.store(false, Ordering::Release);
++                self.set_checkpoint_acceptance(true)?;
++            }
++            "stop" => {
++                if !self.managed_paused.load(Ordering::SeqCst)
++                    || !self.managed_quiesced.load(Ordering::Acquire)
++                {
++                    return Err(failure("stop requires successful durable prepare"));
++                }
++                state.phase = "stopping".into();
++                crate::managed_update::write(config, &state)?;
++                self.managed_stop.store(true, Ordering::Release);
++                // Control transport requests Stop only after writing the acknowledgement.
++            }
++            "health" => {
++                if state.phase != "validating" {
++                    return Err(failure("health requires validation phase"));
++                }
++            }
++            "resume" => {
++                if state.phase != "validating"
++                    || !self.managed_status()?["ready"].as_bool().unwrap_or(false)
++                {
++                    return Err(failure("resume requires healthy validation daemon"));
++                }
++                crate::managed_update::VALIDATING.store(false, Ordering::Release);
++                self.managed_quiesced.store(false, Ordering::Release);
++                self.managed_paused.store(false, Ordering::SeqCst);
++                crate::managed_update::PAUSED.store(false, Ordering::Release);
++                self.set_checkpoint_acceptance(true)?;
++            }
++            _ => return Err(failure("unknown managed control action")),
++        }
++        self.managed_status()
++    }
++
+     async fn handle_control_request(&self, request: ControlRequest) -> ControlResponse {
++        if self.managed_paused.load(Ordering::SeqCst)
++            && !matches!(
++                &request,
++                ControlRequest::Ping
++                    | ControlRequest::ManagedInspect
++                    | ControlRequest::ManagedUpdate { .. }
++                    | ControlRequest::StatsIngest
++            )
++        {
++            return ControlResponse::err("git-ai maintenance active; admission closed");
++        }
+         let result = match request {
+             ControlRequest::Ping => Ok(ControlResponse::ok(None, None)),
++            ControlRequest::ManagedInspect => self
++                .managed_status()
++                .map(|value| ControlResponse::ok(None, Some(value))),
++            ControlRequest::ManagedUpdate {
++                action,
++                transaction,
++            } => self
++                .managed_control(&action, &transaction)
++                .await
++                .map(|value| ControlResponse::ok(None, Some(value))),
+             ControlRequest::EnterpriseTelemetry { action } => {
+                 tokio::task::spawn_blocking(move || crate::enterprise_metrics::control(&action))
+                     .await
+@@ -8104,7 +8318,8 @@ fn handle_control_connection_actor_reader<R: ControlConnection>(
+                 }
+             }
+             Ok(req) => {
+-                let is_shutdown = matches!(req, ControlRequest::Shutdown);
++                let is_shutdown = matches!(&req, ControlRequest::Shutdown)
++                    || matches!(&req, ControlRequest::ManagedUpdate { action, .. } if action == "stop");
+                 let response = runtime_handle
+                     .block_on(async { coordinator.handle_control_request(req).await });
+                 shutdown_after_response = is_shutdown && response.ok;
+@@ -8523,6 +8738,35 @@ fn process_trace_connection_line(
+     coordinator: Arc<ActorDaemonCoordinator>,
+     observed_roots: &mut std::collections::BTreeSet<String>,
+ ) -> Result<Option<TraceLineOutcome>, GitAiError> {
++    // Two atomic operations establish an admission fence; no disk, network or Git work.
++    struct TraceAdmission<'a>(&'a AtomicUsize);
++    impl Drop for TraceAdmission<'_> {
++        fn drop(&mut self) {
++            self.0.fetch_sub(1, Ordering::SeqCst);
++        }
++    }
++    let _admission = if coordinator.managed_config.is_some()
++        && raw_trace_event_type(line.trim()) != Some(TRACE_DRAIN_PROBE_EVENT)
++    {
++        coordinator
++            .managed_trace_readers
++            .fetch_add(1, Ordering::SeqCst);
++        let guard = TraceAdmission(&coordinator.managed_trace_readers);
++        if coordinator.managed_paused.load(Ordering::SeqCst) {
++            coordinator
++                .trace_connections_dropped
++                .fetch_add(1, Ordering::Relaxed);
++            return Ok(Some(TraceLineOutcome {
++                continue_reading: false,
++            }));
++        }
++        coordinator
++            .managed_last_activity
++            .fetch_add(1, Ordering::Relaxed);
++        Some(guard)
++    } else {
++        None
++    };
+     let trimmed = line.trim();
+     if trimmed.is_empty() {
+         return Ok(None);
+@@ -8685,6 +8929,15 @@ fn daemon_socket_health_check_interval() -> u64 {
+ /// replacement process could not actually be started, so failed launch
+ /// attempts do not burn the allowance a later stall needs to self-heal.
+ fn spawn_self_restart(restart_history_path: &Path) -> Result<(), String> {
++    if crate::managed_update::managed() {
++        let config = DaemonConfig::from_env_or_default_paths().map_err(|e| e.to_string())?;
++        if crate::managed_update::read(&config)
++            .map_err(|e| e.to_string())?
++            .is_some()
++        {
++            return Err("managed maintenance blocks self restart".into());
++        }
++    }
+     if !consume_self_restart_budget(restart_history_path) {
+         return Err("self-restart budget exhausted; not restarting".to_string());
+     }
+@@ -9107,6 +9360,28 @@ fn trace_drain_probe_round_trip(
+ /// signals shutdown.  When an update is detected, it requests a graceful
+ /// shutdown so the daemon can self-update after draining in-flight work.
+ fn daemon_update_check_loop(coordinator: Arc<ActorDaemonCoordinator>, started_at_ns: u128) {
++    if crate::managed_update::managed() {
++        let mut delay = 60 + rand::random::<u64>() % 241;
++        loop {
++            let guard = coordinator
++                .shutdown_condvar_mutex
++                .lock()
++                .unwrap_or_else(|e| e.into_inner());
++            if coordinator.is_shutting_down() {
++                return;
++            }
++            let _ = coordinator
++                .shutdown_condvar
++                .wait_timeout(guard, Duration::from_secs(delay));
++            if coordinator.is_shutting_down() {
++                return;
++            }
++            if !coordinator.managed_paused.load(Ordering::SeqCst) {
++                crate::managed_update::trigger_check();
++            }
++            delay = 60;
++        }
++    }
+     use crate::commands::upgrade::{DaemonUpdateCheckResult, check_for_update_available};
+ 
+     let interval = daemon_update_check_interval().max(1);
+@@ -9201,12 +9476,20 @@ pub(crate) fn daemon_run_pending_self_update() -> DaemonSelfUpdateOutcome {
+     }
+ }
+ 
+-pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction, GitAiError> {
++pub(crate) async fn run_daemon_with_transaction(
++    config: DaemonConfig,
++    transaction: Option<String>,
++) -> Result<DaemonExitAction, GitAiError> {
+     sanitize_git_env_for_daemon();
+     disable_trace2_for_daemon_process();
++    let startup_gate = crate::managed_update::startup_guard(&config, transaction.as_deref())?;
+     config.ensure_parent_dirs()?;
++    if transaction.is_some() {
++        crate::managed_update::offline_health(&config)?;
++    }
+     remove_stale_daemon_files(&config);
+     let _lock = DaemonLock::acquire(&config.lock_path)?;
++    drop(startup_gate);
+     let _active_guard = DaemonProcessActiveGuard::enter();
+     write_pid_metadata(&config)?;
+ 
+@@ -9249,7 +9532,31 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
+     remove_socket_if_exists(&config.control_socket_path)?;
+ 
+     let mut coordinator_inner = ActorDaemonCoordinator::new();
+-
++    if crate::managed_update::managed() {
++        coordinator_inner.managed_config = Some(config.clone());
++        if crate::managed_update::VALIDATING.load(Ordering::Acquire) {
++            coordinator_inner
++                .managed_paused
++                .store(true, Ordering::SeqCst);
++            coordinator_inner
++                .accepting_checkpoints
++                .store(false, Ordering::Release);
++            coordinator_inner
++                .managed_quiesced
++                .store(true, Ordering::Release);
++        }
++    }
++
++    if crate::managed_update::managed() {
++        crate::metrics::db::MetricsDatabase::global()?;
++        crate::notes::db::NotesDatabase::global()?;
++        crate::authorship::internal_db::InternalDatabase::global()?;
++        if crate::managed_update::data_failed() {
++            return Err(GitAiError::Generic(
++                "managed runtime database initialization failed".into(),
++            ));
++        }
++    }
+     // Spawn the telemetry worker inside the daemon's tokio runtime.
+     let telemetry_handle = crate::daemon::telemetry_worker::spawn_telemetry_worker();
+     crate::daemon::telemetry_worker::set_daemon_internal_telemetry(telemetry_handle.clone());
+@@ -9262,7 +9569,7 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
+     let token_usage_enabled = config::Config::get()
+         .get_feature_flags()
+         .token_usage_metrics;
+-    if !token_usage_enabled {
++    if !token_usage_enabled && !crate::managed_update::VALIDATING.load(Ordering::Acquire) {
+         crate::token_usage::db::TokenUsageDatabase::remove_database_files(&token_usage_db_path);
+     }
+ 
+@@ -9517,7 +9824,9 @@ fn spawn_shutdown_deadline_enforcer(
+                         .unwrap_or_else(|e| e.into_inner());
+                 }
+             }
++            if coordinator.managed_stop.load(Ordering::Acquire) { return; }
+             std::thread::sleep(daemon_shutdown_deadline());
++            if coordinator.managed_stop.load(Ordering::Acquire) { return; }
+             if coordinator.teardown_complete.load(Ordering::Acquire) {
+                 return;
+             }
+@@ -9591,7 +9900,9 @@ fn checkpoint_control_response_timeout(
+             Duration::from_secs(timeout_secs.saturating_add(5))
+         }
+         ControlRequest::ReingestMetrics { .. } => DAEMON_CHECKPOINT_RESPONSE_TIMEOUT,
+-        ControlRequest::Shutdown => DAEMON_CHECKPOINT_RESPONSE_TIMEOUT,
++        ControlRequest::Shutdown | ControlRequest::ManagedUpdate { .. } => {
++            DAEMON_CHECKPOINT_RESPONSE_TIMEOUT
++        }
+         _ => DAEMON_CONTROL_RESPONSE_TIMEOUT,
+     }
+ }
+diff --git a/src/daemon/bash_sessions.rs b/src/daemon/bash_sessions.rs
+index 52ba9a3..96d1182 100644
+--- a/src/daemon/bash_sessions.rs
++++ b/src/daemon/bash_sessions.rs
+@@ -34,6 +34,12 @@ pub struct BashSessionState {
+ }
+ 
+ impl BashSessionState {
++    pub(crate) fn has_active(&self) -> bool {
++        self.sessions
++            .values()
++            .any(|s| s.started_at.elapsed() < Duration::from_secs(STALE_SESSION_SECS))
++    }
++
+     pub fn new() -> Self {
+         Self::default()
+     }
+diff --git a/src/daemon/control_api.rs b/src/daemon/control_api.rs
+index f811e2e..8ecc026 100644
+--- a/src/daemon/control_api.rs
++++ b/src/daemon/control_api.rs
+@@ -10,6 +10,10 @@ use std::collections::HashMap;
+ pub enum ControlRequest {
+     #[serde(rename = "ping")]
+     Ping,
++    #[serde(rename = "update.inspect")]
++    ManagedInspect,
++    #[serde(rename = "update.manage")]
++    ManagedUpdate { action: String, transaction: String },
+     #[serde(rename = "enterprise.telemetry")]
+     EnterpriseTelemetry { action: String },
+     #[serde(rename = "checkpoint.run")]
+@@ -215,3 +219,18 @@ mod tests {
+         );
+     }
+ }
++
++#[cfg(test)]
++mod managed_update_tests {
++    use super::*;
++    #[test]
++    fn managed_update_inspect_has_versioned_control_request() {
++        let request = serde_json::from_value::<ControlRequest>(serde_json::json!({
++            "method": "update.inspect"
++        }));
++        assert!(
++            request.is_ok(),
++            "managed daemon must expose read-only inspect without autospawn"
++        );
++    }
++}
+diff --git a/src/daemon/rewrite_metrics.rs b/src/daemon/rewrite_metrics.rs
+index 11347ce..669b6d2 100644
+--- a/src/daemon/rewrite_metrics.rs
++++ b/src/daemon/rewrite_metrics.rs
+@@ -21,19 +21,25 @@ pub(crate) fn spawn_rewrite_commit_metrics(
+     }
+ 
+     let repo = repo.clone();
++    let producer = crate::managed_update::producer();
+     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+         runtime.spawn(async move {
++            let _producer = producer;
+             let result = tokio::task::spawn_blocking(move || {
+                 build_rewrite_metric_events(&repo, &metric_commits)
+             })
+             .await;
+             match result {
+                 Ok(events) => submit_events(events),
+-                Err(err) => tracing::warn!(%err, "rewrite metrics worker panicked"),
++                Err(err) => {
++                    crate::managed_update::record_data_failure();
++                    tracing::warn!(%err, "rewrite metrics worker panicked");
++                }
+             }
+         });
+     } else {
+         std::thread::spawn(move || {
++            let _producer = producer;
+             submit_events(build_rewrite_metric_events(&repo, &metric_commits));
+         });
+     }
+diff --git a/src/daemon/stream_worker.rs b/src/daemon/stream_worker.rs
+index 593e148..e8766c6 100644
+--- a/src/daemon/stream_worker.rs
++++ b/src/daemon/stream_worker.rs
+@@ -395,11 +395,11 @@ impl StreamWorker {
+                     self.shutdown_flag.store(true, Ordering::Relaxed);
+                     break;
+                 }
+-                _ = async {}, if has_ready_task => {
++                _ = async {}, if has_ready_task && !crate::managed_update::PAUSED.load(Ordering::Acquire) => {
+                     self.process_next_task().await;
+                 }
+                 _ = retry_sleep => {}
+-                _ = sweep_ticker.tick() => {  // NEW: sweep ticker
++                _ = sweep_ticker.tick(), if !crate::managed_update::PAUSED.load(Ordering::Acquire) => {  // NEW: sweep ticker
+                     if sweep_enabled
+                         && self
+                             .sweep_trigger_gate
+@@ -477,6 +477,9 @@ impl StreamWorker {
+             self.process_next_task().await;
+         }
+ 
++        if !self.delayed_tasks.is_empty() {
++            crate::managed_update::record_data_failure();
++        }
+         let _ = request.completion.send(());
+     }
+ 
+@@ -1238,6 +1241,7 @@ impl StreamWorker {
+ 
+     /// Handle a processing error with exponential backoff.
+     async fn handle_processing_error(&mut self, task: ProcessingTask, error: StreamError) {
++        crate::managed_update::record_data_failure();
+         match error {
+             StreamError::Transient { message, .. } => {
+                 // Retry with exponential backoff: 5s, 30s, 5m, 30m
+@@ -1420,6 +1424,7 @@ pub fn spawn_stream_worker(
+     );
+ 
+     tokio::spawn(async move {
++        crate::managed_update::wait_for_resume().await;
+         worker.run().await;
+     });
+ 
+diff --git a/src/daemon/telemetry_worker.rs b/src/daemon/telemetry_worker.rs
+index 3872b30..e97674a 100644
+--- a/src/daemon/telemetry_worker.rs
++++ b/src/daemon/telemetry_worker.rs
+@@ -238,7 +238,7 @@ enum MetricsPersistRequest {
+     Store(Vec<MetricEvent>),
+     /// Flush marker: when the ack fires, every `Store` enqueued before this
+     /// marker has been written to SQLite.
+-    Flush(tokio::sync::oneshot::Sender<()>),
++    Flush(tokio::sync::oneshot::Sender<bool>),
+ }
+ 
+ /// Send a flush marker through the persist queue and wait for its ack, so
+@@ -259,7 +259,7 @@ async fn drain_metrics_persist_requests(
+         {
+             return false;
+         }
+-        ack_rx.await.is_ok()
++        ack_rx.await.unwrap_or(false)
+     };
+     tokio::time::timeout(deadline, drain).await.unwrap_or(false)
+ }
+@@ -591,6 +591,7 @@ pub fn spawn_telemetry_worker() -> DaemonTelemetryWorkerHandle {
+ 
+     telemetry_runtime.spawn(metrics_persist_loop(metrics_persist_rx));
+     telemetry_runtime.spawn(async move {
++        crate::managed_update::wait_for_resume().await;
+         telemetry_flush_loop(
+             buffer,
+             daemon_id,
+@@ -607,6 +608,7 @@ pub fn spawn_telemetry_worker() -> DaemonTelemetryWorkerHandle {
+ /// Drains the bounded metrics-persistence queue: one SQLite write at a time,
+ /// on the telemetry runtime's blocking pool.
+ async fn metrics_persist_loop(mut rx: tokio::sync::mpsc::Receiver<MetricsPersistRequest>) {
++    let mut durable = true;
+     while let Some(request) = rx.recv().await {
+         match request {
+             MetricsPersistRequest::Store(metric_events) => {
+@@ -626,11 +628,12 @@ async fn metrics_persist_loop(mut rx: tokio::sync::mpsc::Receiver<MetricsPersist
+                             )))
+                         });
+                 if let Err(e) = result {
++                    durable = false;
+                     tracing::warn!(%e, "telemetry: failed to persist metrics locally");
+                 }
+             }
+             MetricsPersistRequest::Flush(ack) => {
+-                let _ = ack.send(());
++                let _ = ack.send(durable);
+             }
+         }
+     }
+@@ -641,8 +644,12 @@ fn spawn_metrics_metadata_backfill(telemetry_runtime: &tokio::runtime::Runtime)
+         return;
+     }
+ 
+-    std::mem::drop(telemetry_runtime.spawn_blocking(|| {
+-        if let Err(e) = backfill_metrics_event_metadata() {
++    std::mem::drop(telemetry_runtime.spawn(async {
++        crate::managed_update::wait_for_resume().await;
++        if let Err(e) = tokio::task::spawn_blocking(backfill_metrics_event_metadata)
++            .await
++            .unwrap_or_else(|e| Err(GitAiError::Generic(e.to_string())))
++        {
+             tracing::warn!(%e, "telemetry: failed to backfill metrics event metadata");
+         }
+     }));
+@@ -1860,6 +1867,22 @@ impl SentryClient {
+ 
+ #[cfg(test)]
+ mod tests {
++    #[tokio::test]
++    async fn managed_update_persistence_barrier_rejects_negative_durable_ack() {
++        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
++        let producer = tokio::spawn(async move {
++            if let Some(super::MetricsPersistRequest::Flush(ack)) = rx.recv().await {
++                ack.send(false).unwrap();
++            } else {
++                panic!("expected FIFO persistence barrier");
++            }
++        });
++        assert!(
++            !super::drain_metrics_persist_requests(&tx, std::time::Duration::from_secs(1)).await
++        );
++        producer.await.unwrap();
++    }
++
+     use super::*;
+     use crate::api::metrics::MetricsUploadError;
+     use std::cell::RefCell;
+diff --git a/src/daemon/token_usage_worker.rs b/src/daemon/token_usage_worker.rs
+index 6902888..3407c26 100644
+--- a/src/daemon/token_usage_worker.rs
++++ b/src/daemon/token_usage_worker.rs
+@@ -213,6 +213,7 @@ pub fn spawn_token_usage_worker(
+         test_throttle: None,
+     };
+     tokio::spawn(async move {
++        crate::managed_update::wait_for_resume().await;
+         worker.run().await;
+     });
+     TokenUsageWorkerHandle {
+@@ -292,7 +293,7 @@ impl TokenUsageWorker {
+                     self.shutdown_flag.store(true, Ordering::Relaxed);
+                     break;
+                 }
+-                _ = async {}, if has_ready_task => {
++                _ = async {}, if has_ready_task && !crate::managed_update::PAUSED.load(Ordering::Acquire) => {
+                     // Ingest pending notifications first so fresh work is
+                     // picked (and promoted over backfill) before the next
+                     // task is chosen.
+@@ -303,7 +304,7 @@ impl TokenUsageWorker {
+                         self.process_task(task, origin).await;
+                     }
+                 }
+-                _ = sweep_ticker.tick() => {
++                _ = sweep_ticker.tick(), if !crate::managed_update::PAUSED.load(Ordering::Acquire) => {
+                     self.prune_old_entries().await;
+                     self.enqueue_sweep_tasks().await;
+                     // Crash recovery: reconcile flags left by a pass that
+@@ -471,9 +472,11 @@ impl TokenUsageWorker {
+         match result {
+             Ok(Ok(())) => {}
+             Ok(Err(e)) => {
++                crate::managed_update::record_data_failure();
+                 tracing::warn!(error = %e, session_id = %task.session_id, "token-usage processing failed");
+             }
+             Err(e) => {
++                crate::managed_update::record_data_failure();
+                 tracing::error!(error = %e, session_id = %task.session_id, "token-usage task panicked");
+             }
+         }
+diff --git a/src/enterprise_metrics/mod.rs b/src/enterprise_metrics/mod.rs
+index fe1a58c..7017e1f 100644
+--- a/src/enterprise_metrics/mod.rs
++++ b/src/enterprise_metrics/mod.rs
+@@ -1,7 +1,7 @@
+ //! Optional enterprise telemetry; disabled unless explicitly configured.
+ pub mod config;
+ pub mod domain;
+-mod embedded;
++pub(crate) mod embedded;
+ pub mod identity;
+ pub mod projection;
+ pub mod sink;
+diff --git a/src/enterprise_metrics/worker.rs b/src/enterprise_metrics/worker.rs
+index 6b95e71..0c36b92 100644
+--- a/src/enterprise_metrics/worker.rs
++++ b/src/enterprise_metrics/worker.rs
+@@ -31,6 +31,7 @@ pub fn spawn() {
+     }
+     config::reload();
+     crate::tokio_runtime::telemetry_runtime().spawn(async {
++        crate::managed_update::wait_for_resume().await;
+         let mut state=State::default();
+         loop {
+             state=tokio::task::spawn_blocking(move || {
+diff --git a/src/lib.rs b/src/lib.rs
+index 5d4b950..5b6177c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -13,6 +13,7 @@ pub mod error;
+ pub mod feature_flags;
+ pub mod git;
+ pub mod http;
++pub(crate) mod managed_update;
+ pub mod mdm;
+ pub mod metrics;
+ pub mod notes;
+diff --git a/src/main.rs b/src/main.rs
+index e2533e4..16c0b34 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -26,6 +26,7 @@ fn is_superuser_exempt_command(args: &[String]) -> bool {
+             | "--version"
+             | "-v"
+             | "upgrade"
++            | "managed-update"
+             | "debug"
+             | "uninstall"
+             | "uninstall-hooks"
+@@ -68,7 +69,10 @@ fn main() {
+         }
+     }
+ 
+-    if binary_name == "git-ai" || binary_name == "git-ai.exe" {
++    if binary_name == "git-ai"
++        || binary_name == "git-ai.exe"
++        || cli.args.first().is_some_and(|arg| arg == "managed-update")
++    {
+         // Block elevated privileges to prevent creating root-owned files
+         // that break normal-user daemon startup. Only applies to direct
+         // `git-ai` commands (not the git proxy, which must stay transparent).
+diff --git a/src/managed_update.rs b/src/managed_update.rs
+new file mode 100644
+index 0000000..1e9c44a
+--- /dev/null
++++ b/src/managed_update.rs
+@@ -0,0 +1,890 @@
++//! TCLI-owned update coordination. Disk access is confined to process/control entry points.
++use crate::daemon::{DaemonConfig, control_api::ControlRequest};
++use crate::error::GitAiError;
++use crate::utils::LockFile;
++use serde::{Deserialize, Serialize};
++use serde_json::{Value, json};
++use std::{
++    fs,
++    path::{Path, PathBuf},
++    sync::atomic::{AtomicBool, Ordering},
++    time::Duration,
++};
++
++static INSTALLATION: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
++pub(crate) fn installation() -> Result<PathBuf, GitAiError> {
++    match INSTALLATION.get() {
++        Some(path) => Ok(path.clone()),
++        None => Ok(fs::canonicalize(std::env::current_exe()?)?),
++    }
++}
++
++pub(crate) static PAUSED: AtomicBool = AtomicBool::new(false);
++static PRODUCERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++pub(crate) struct Producer;
++pub(crate) fn producer() -> Producer {
++    PRODUCERS.fetch_add(1, Ordering::AcqRel);
++    Producer
++}
++impl Drop for Producer {
++    fn drop(&mut self) {
++        PRODUCERS.fetch_sub(1, Ordering::AcqRel);
++    }
++}
++pub(crate) async fn drain_producers() {
++    while PRODUCERS.load(Ordering::Acquire) != 0 {
++        tokio::time::sleep(Duration::from_millis(1)).await;
++    }
++}
++static DATA_FAILED: AtomicBool = AtomicBool::new(false);
++pub(crate) fn record_data_failure() {
++    if managed() {
++        DATA_FAILED.store(true, Ordering::Release);
++    }
++}
++pub(crate) fn data_failed() -> bool {
++    DATA_FAILED.load(Ordering::Acquire)
++}
++pub(crate) static VALIDATING: AtomicBool = AtomicBool::new(false);
++pub(crate) fn managed() -> bool {
++    option_env!("TCLI_MANAGED_GIT_AI") == Some("1") || wrapper_version() != "development"
++}
++pub(crate) fn wrapper_version() -> &'static str {
++    crate::enterprise_metrics::embedded::WRAPPER_VERSION
++}
++fn error(message: impl Into<String>) -> GitAiError {
++    GitAiError::Generic(message.into())
++}
++fn invocation_owns_installation(target: &Path) -> Result<bool, GitAiError> {
++    let current = fs::canonicalize(std::env::current_exe()?)?;
++    if current == target {
++        return Ok(true);
++    }
++    let parent = target
++        .parent()
++        .ok_or_else(|| error("installation has no parent"))?;
++    // Staged bridge copies live only below the same protected installation directory.
++    Ok(current.starts_with(parent.join("update"))
++        || current.starts_with(parent.join(".tcli").join("update")))
++}
++fn set_installation(path: &str) -> Result<(), GitAiError> {
++    let path = PathBuf::from(path);
++    if !path.is_absolute()
++        || path
++            .components()
++            .any(|p| matches!(p, std::path::Component::ParentDir))
++    {
++        return Err(error("installation must be an absolute normalized path"));
++    }
++    let parent = path
++        .parent()
++        .ok_or_else(|| error("installation has no parent"))?;
++    verify_path(parent)?;
++    if fs::symlink_metadata(&path).is_ok() {
++        verify_path(&path)?;
++    }
++    let path = fs::canonicalize(parent)?.join(
++        path.file_name()
++            .ok_or_else(|| error("installation has no filename"))?,
++    );
++    if !invocation_owns_installation(&path)? {
++        return Err(error(
++            "bridge is outside the controlled installation or staging directory",
++        ));
++    }
++    INSTALLATION
++        .set(path)
++        .map_err(|_| error("installation already selected"))
++}
++// One installed binary owns one immutable runtime namespace, including data homes.
++// Keeping the binding beside the installation makes HOME overrides observable.
++fn normalized(path: &Path) -> Result<PathBuf, GitAiError> {
++    if !path.is_absolute()
++        || path
++            .components()
++            .any(|c| matches!(c, std::path::Component::ParentDir))
++    {
++        return Err(error("runtime binding requires absolute normalized paths"));
++    }
++    if path.exists() {
++        return Ok(fs::canonicalize(path)?);
++    }
++    let parent = path
++        .parent()
++        .ok_or_else(|| error("runtime binding path has no parent"))?;
++    Ok(normalized(parent)?.join(
++        path.file_name()
++            .ok_or_else(|| error("runtime binding path has no name"))?,
++    ))
++}
++fn runtime_identity(config: &DaemonConfig) -> Result<Value, GitAiError> {
++    Ok(json!({"protocol":1,"installation":installation()?,
++        "home":normalized(&config.internal_dir)?, "lock":normalized(&config.lock_path)?,
++        "control":config.control_socket_path, "trace":config.trace_socket_path,
++        "metrics":normalized(&crate::metrics::db::MetricsDatabase::database_path()?)?,
++        "notes":normalized(&crate::notes::db::NotesDatabase::database_path()?)?,
++        "authorship":normalized(&crate::authorship::internal_db::InternalDatabase::database_path()?)?}))
++}
++fn runtime_binding(config: &DaemonConfig, create: bool) -> Result<(), GitAiError> {
++    let executable = installation()?;
++    let parent = executable
++        .parent()
++        .ok_or_else(|| error("runtime binding installation has no parent"))?;
++    let dir = parent.join(".git-ai-runtime");
++    let path = dir.join("binding.json");
++    let expected = runtime_identity(config)?;
++    let check = || -> Result<(), GitAiError> {
++        verify_path(&dir)?;
++        verify_path(&path)?;
++        #[cfg(windows)]
++        {
++            platform::verify_private(&dir)?;
++            platform::verify_private(&path)?;
++        }
++        let actual: Value = serde_json::from_slice(&fs::read(&path)?)?;
++        if actual != expected {
++            return Err(error(
++                "runtime binding mismatch: this installation already owns another runtime/data home",
++            ));
++        }
++        Ok(())
++    };
++    if fs::symlink_metadata(&path).is_ok() {
++        return check();
++    }
++    if !create {
++        // An incomplete durable binding is never treated as an unbound installation.
++        if fs::symlink_metadata(&dir).is_ok() {
++            return Err(error("runtime binding is incomplete; recover installation"));
++        }
++        return Ok(());
++    }
++    verify_path(parent)?;
++    private_directory(&dir)?;
++    let lock_path = dir.join("binding.lock");
++    if lock_path.exists() {
++        verify_path(&lock_path)?;
++    }
++    let deadline = std::time::Instant::now() + Duration::from_secs(2);
++    let _lock = loop {
++        if let Some(lock) = LockFile::try_acquire(&lock_path) {
++            break lock;
++        }
++        if std::time::Instant::now() >= deadline {
++            return Err(error("runtime binding is busy"));
++        }
++        std::thread::sleep(Duration::from_millis(10));
++    };
++    if fs::symlink_metadata(&path).is_ok() {
++        return check();
++    }
++    use std::io::Write;
++    let temporary = dir.join(format!("binding-{}.tmp", crate::uuid::generate_v4()));
++    let mut options = fs::OpenOptions::new();
++    options.create_new(true).write(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.mode(0o600);
++    }
++    let mut file = options.open(&temporary)?;
++    #[cfg(windows)]
++    platform::make_private(&temporary)?;
++    file.write_all(&serde_json::to_vec(&expected)?)?;
++    file.sync_all()?;
++    drop(file);
++    #[cfg(not(windows))]
++    fs::rename(&temporary, &path)?;
++    #[cfg(windows)]
++    platform::replace(&temporary, &path)?;
++    sync_directory(&dir)?;
++    sync_directory(parent)
++}
++fn valid_transaction(value: &str) -> bool {
++    value.len() == 36
++        && value.bytes().enumerate().all(|(i, b)| {
++            if [8, 13, 18, 23].contains(&i) {
++                b == b'-'
++            } else {
++                b.is_ascii_hexdigit()
++            }
++        })
++}
++#[derive(Clone, Serialize, Deserialize)]
++pub(crate) struct Maintenance {
++    pub transaction: String,
++    pub executable: PathBuf,
++    pub phase: String,
++}
++fn directory(config: &DaemonConfig) -> PathBuf {
++    config.internal_dir.join("managed-update")
++}
++fn state_path(config: &DaemonConfig) -> PathBuf {
++    directory(config).join("state.json")
++}
++
++fn verify_path(path: &Path) -> Result<(), GitAiError> {
++    let metadata = fs::symlink_metadata(path)?;
++    if metadata.file_type().is_symlink() {
++        return Err(error("managed update rejects symlinks"));
++    }
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::MetadataExt;
++        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
++            return Err(error(
++                "managed update requires current-user ownership and no group/other writes",
++            ));
++        }
++    }
++    #[cfg(windows)]
++    {
++        use std::os::windows::fs::MetadataExt;
++        if metadata.file_attributes() & 0x400 != 0 {
++            return Err(error("managed update rejects reparse points"));
++        }
++        // Windows ownership/DACL verification is implemented by the platform helper.
++        platform::verify_owner(path)?;
++    }
++    Ok(())
++}
++fn ensure_directory(config: &DaemonConfig) -> Result<(), GitAiError> {
++    fs::create_dir_all(&config.internal_dir)?;
++    verify_path(&config.internal_dir)?;
++    private_directory(&directory(config))
++}
++fn private_directory(dir: &Path) -> Result<(), GitAiError> {
++    match fs::create_dir(dir) {
++        Ok(()) => {
++            #[cfg(unix)]
++            {
++                use std::os::unix::fs::PermissionsExt;
++                fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
++            }
++            #[cfg(windows)]
++            platform::make_private(dir)?;
++        }
++        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
++        Err(e) => return Err(e.into()),
++    }
++    verify_path(dir)?;
++    #[cfg(windows)]
++    platform::verify_private(dir)?;
++    Ok(())
++}
++pub(crate) fn gate(config: &DaemonConfig) -> Result<LockFile, GitAiError> {
++    ensure_directory(config)?;
++    let path = directory(config).join("gate.lock");
++    if fs::symlink_metadata(&path).is_ok() {
++        verify_path(&path)?;
++    }
++    let deadline = std::time::Instant::now() + Duration::from_secs(2);
++    loop {
++        if let Some(lock) = LockFile::try_acquire(&path) {
++            return Ok(lock);
++        }
++        if std::time::Instant::now() >= deadline {
++            return Err(error("managed update runtime gate is busy"));
++        }
++        std::thread::sleep(Duration::from_millis(10));
++    }
++}
++pub(crate) fn read(config: &DaemonConfig) -> Result<Option<Maintenance>, GitAiError> {
++    let path = state_path(config);
++    match fs::symlink_metadata(&path) {
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
++        Err(e) => return Err(e.into()),
++        Ok(_) => {}
++    }
++    verify_path(&directory(config))?;
++    verify_path(&path)?;
++    #[cfg(windows)]
++    {
++        platform::verify_private(&directory(config))?;
++        platform::verify_private(&path)?;
++    }
++    let state: Maintenance = serde_json::from_slice(&fs::read(&path)?)?;
++    if !valid_transaction(&state.transaction) {
++        return Err(error("invalid durable maintenance transaction"));
++    }
++    Ok(Some(state))
++}
++fn sync_directory(path: &Path) -> Result<(), GitAiError> {
++    #[cfg(unix)]
++    fs::File::open(path)?.sync_all()?;
++    #[cfg(windows)]
++    {
++        let _ = path;
++    }
++    Ok(())
++}
++pub(crate) fn write(config: &DaemonConfig, state: &Maintenance) -> Result<(), GitAiError> {
++    use std::io::Write;
++    let path = directory(config).join(format!("state-{}.tmp", crate::uuid::generate_v4()));
++    let mut options = fs::OpenOptions::new();
++    options.create_new(true).write(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.mode(0o600);
++    }
++    let mut file = options.open(&path)?;
++    #[cfg(windows)]
++    platform::make_private(&path)?;
++    file.write_all(&serde_json::to_vec(state)?)?;
++    file.sync_all()?;
++    drop(file);
++    #[cfg(not(windows))]
++    fs::rename(&path, state_path(config))?;
++    #[cfg(windows)]
++    platform::replace(&path, &state_path(config))?;
++    sync_directory(&directory(config))
++}
++pub(crate) fn clear(config: &DaemonConfig) -> Result<(), GitAiError> {
++    match fs::remove_file(state_path(config)) {
++        Ok(()) => {}
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
++        Err(e) => return Err(e.into()),
++    }
++    sync_directory(&directory(config))
++}
++pub(crate) fn owned(config: &DaemonConfig, transaction: &str) -> Result<Maintenance, GitAiError> {
++    let state = read(config)?.ok_or_else(|| error("no managed update transaction"))?;
++    if !valid_transaction(transaction)
++        || state.transaction != transaction
++        || !invocation_owns_installation(&state.executable)?
++    {
++        return Err(error(
++            "managed update transaction or executable ownership mismatch",
++        ));
++    }
++    Ok(state)
++}
++pub(crate) fn startup_guard(
++    config: &DaemonConfig,
++    transaction: Option<&str>,
++) -> Result<Option<LockFile>, GitAiError> {
++    if !managed() {
++        return Ok(None);
++    }
++    runtime_binding(config, true)?;
++    let guard = gate(config)?;
++    if let Some(state) = read(config)? {
++        if transaction != Some(&state.transaction) || state.phase != "validating" {
++            return Err(error("git-ai maintenance active; startup deferred"));
++        }
++        owned(config, &state.transaction)?;
++        VALIDATING.store(true, Ordering::Release);
++    } else if transaction.is_some() {
++        return Err(error("validation requires a durable transaction"));
++    }
++    Ok(Some(guard))
++}
++
++pub(crate) struct ForegroundLease {
++    lock: Option<LockFile>,
++    path: PathBuf,
++}
++impl Drop for ForegroundLease {
++    fn drop(&mut self) {
++        drop(self.lock.take());
++        let _ = fs::remove_file(&self.path);
++    }
++}
++pub(crate) fn foreground(config: &DaemonConfig) -> Result<Option<ForegroundLease>, GitAiError> {
++    if !managed() {
++        return Ok(None);
++    }
++    runtime_binding(config, true)?;
++    let _gate = gate(config)?;
++    if read(config)?.is_some() {
++        return Err(error("git-ai maintenance active; command deferred"));
++    }
++    let path = directory(config).join(format!("foreground-{}.lock", crate::uuid::generate_v4()));
++    let lock = LockFile::try_acquire(&path)
++        .ok_or_else(|| error("cannot register managed foreground command"))?;
++    Ok(Some(ForegroundLease {
++        lock: Some(lock),
++        path,
++    }))
++}
++pub(crate) fn foreground_watermark(config: &DaemonConfig) -> u64 {
++    fs::metadata(directory(config))
++        .and_then(|m| m.modified())
++        .ok()
++        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
++        .map(|d| d.as_nanos() as u64)
++        .unwrap_or(0)
++}
++pub(crate) fn foreground_in_use(config: &DaemonConfig) -> Result<bool, GitAiError> {
++    let entries = match fs::read_dir(directory(config)) {
++        Ok(entries) => entries,
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
++        Err(e) => return Err(e.into()),
++    };
++    for entry in entries {
++        let path = entry?.path();
++        if !path
++            .file_name()
++            .unwrap_or_default()
++            .to_string_lossy()
++            .starts_with("foreground-")
++        {
++            continue;
++        }
++        let mut options = fs::OpenOptions::new();
++        options.read(true).write(true);
++        #[cfg(windows)]
++        {
++            use std::os::windows::fs::OpenOptionsExt;
++            options.share_mode(0);
++        }
++        let file = match options.open(&path) {
++            Ok(file) => file,
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
++            Err(_) => return Ok(true),
++        };
++        #[cfg(unix)]
++        {
++            use std::os::fd::AsRawFd;
++            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
++                return Ok(true);
++            }
++        }
++        drop(file);
++    }
++    Ok(false)
++}
++fn foreground_busy(config: &DaemonConfig) -> Result<bool, GitAiError> {
++    for entry in fs::read_dir(directory(config))? {
++        let path = entry?.path();
++        if !path
++            .file_name()
++            .unwrap_or_default()
++            .to_string_lossy()
++            .starts_with("foreground-")
++        {
++            continue;
++        }
++        verify_path(&path)?;
++        let Some(lock) = LockFile::try_acquire(&path) else {
++            return Ok(true);
++        };
++        drop(lock);
++        fs::remove_file(path)?;
++    }
++    Ok(false)
++}
++fn local_status(config: &DaemonConfig) -> Result<Value, GitAiError> {
++    offline_health(config)?;
++    let state = read(config)?;
++    Ok(
++        json!({"protocol":1,"wrapper_version":wrapper_version(),"transaction":state.as_ref().map(|s|&s.transaction),
++        "running":false,"pid":null,"executable":installation()?,"daemon_home":config.internal_dir,
++        "busy":false,"idle_seconds":0,"phase":state.as_ref().map(|s|s.phase.as_str()).unwrap_or("normal"),
++        "ready":true,"quiesced":true,"durable":true,"data_schema":1,"data_schema_min":1,"data_schema_max":1}),
++    )
++}
++fn request(config: &DaemonConfig, action: &str, transaction: &str) -> Result<Value, GitAiError> {
++    let response = crate::daemon::send_control_request(
++        &config.control_socket_path,
++        &ControlRequest::ManagedUpdate {
++            action: action.into(),
++            transaction: transaction.into(),
++        },
++    )?;
++    if !response.ok {
++        return Err(error(
++            response
++                .error
++                .unwrap_or_else(|| "managed control failed".into()),
++        ));
++    }
++    response
++        .data
++        .ok_or_else(|| error("managed control returned no identity"))
++}
++pub(crate) fn inspect(config: &DaemonConfig) -> Result<Value, GitAiError> {
++    runtime_binding(config, false)?;
++    if crate::commands::daemon::daemon_is_up(config) {
++        let response = crate::daemon::send_control_request(
++            &config.control_socket_path,
++            &ControlRequest::ManagedInspect,
++        )?;
++        if !response.ok {
++            return Err(error("running daemon lacks managed update protocol"));
++        }
++        let status = response
++            .data
++            .ok_or_else(|| error("daemon returned no managed identity"))?;
++        let reported = status["daemon_home"]
++            .as_str()
++            .ok_or_else(|| error("daemon did not report runtime identity"))?;
++        if fs::canonicalize(reported)? != fs::canonicalize(&config.internal_dir)? {
++            return Err(error(
++                "daemon control endpoint belongs to a different runtime",
++            ));
++        }
++        if status["executable"].as_str() != installation()?.to_str() {
++            return Err(error(
++                "daemon belongs to a different installation; refusing maintenance",
++            ));
++        }
++        Ok(status)
++    } else {
++        // A missing socket is not process-exit evidence. A live lifecycle lock blocks mutation.
++        if config.lock_path.exists() && LockFile::try_acquire(&config.lock_path).is_none() {
++            return Err(error(
++                "daemon lifecycle lock held but control endpoint unavailable",
++            ));
++        }
++        local_status(config)
++    }
++}
++pub(crate) fn execute(
++    config: &DaemonConfig,
++    action: &str,
++    transaction: &str,
++) -> Result<Value, GitAiError> {
++    if !managed() {
++        return Err(error(
++            "managed-update is available only in TCLI-managed builds",
++        ));
++    }
++    if action == "inspect" {
++        return inspect(config);
++    }
++    if !valid_transaction(transaction) {
++        return Err(error("--transaction must be a UUID"));
++    }
++    inspect(config)?;
++    runtime_binding(config, true)?;
++    let _gate = gate(config)?;
++    let before = inspect(config)?;
++    let running = before["running"].as_bool() == Some(true);
++    if running && before["executable"].as_str() != installation()?.to_str() {
++        return Err(error(
++            "daemon belongs to a different installation; refusing maintenance",
++        ));
++    }
++    match action {
++        "prepare" => {
++            if let Some(state) = read(config)? {
++                owned(config, transaction)?;
++                if state.phase != "prepared" {
++                    return Err(error("transaction already stopping or validating"));
++                }
++            }
++            if foreground_busy(config)? {
++                return Err(error("busy: foreground git-ai commands remain"));
++            }
++            let state = Maintenance {
++                transaction: transaction.into(),
++                executable: installation()?,
++                phase: "prepared".into(),
++            };
++            write(config, &state)?;
++            if running {
++                request(config, action, transaction)
++            } else {
++                local_status(config)
++            }
++        }
++        "abort" => {
++            if read(config)?.is_none() {
++                return inspect(config);
++            }
++            let state = owned(config, transaction)?;
++            if state.phase != "prepared" {
++                return Err(error("cannot abort after stop; recover transaction"));
++            }
++            if running {
++                request(config, action, transaction)?;
++            }
++            clear(config)?;
++            inspect(config)
++        }
++        "stop" => {
++            owned(config, transaction)?;
++            if running {
++                request(config, action, transaction)
++            } else {
++                let mut state = owned(config, transaction)?;
++                state.phase = "stopping".into();
++                write(config, &state)?;
++                local_status(config)
++            }
++        }
++        "start" => {
++            let mut state = owned(config, transaction)?;
++            if running {
++                return Err(error(
++                    "daemon still running; independently confirm process exit before start",
++                ));
++            }
++            state.phase = "validating".into();
++            write(config, &state)?;
++            crate::commands::daemon::spawn_managed_validation(config, transaction)
++                .map_err(error)?;
++            drop(_gate);
++            let deadline = std::time::Instant::now() + Duration::from_secs(15);
++            loop {
++                if crate::commands::daemon::daemon_is_up(config) {
++                    return request(config, "health", transaction);
++                }
++                if std::time::Instant::now() >= deadline {
++                    return Err(error("validation startup timed out"));
++                }
++                std::thread::sleep(Duration::from_millis(25));
++            }
++        }
++        "health" => {
++            owned(config, transaction)?;
++            if running {
++                request(config, action, transaction)
++            } else {
++                local_status(config)
++            }
++        }
++        "resume" => {
++            if read(config)?.is_none() {
++                return inspect(config);
++            }
++            owned(config, transaction)?;
++            if running {
++                request(config, action, transaction)?;
++            }
++            clear(config)?;
++            inspect(config)
++        }
++        _ => Err(error("unknown managed-update action")),
++    }
++}
++pub(crate) fn handle(args: &[String]) {
++    let action = args.first().map(String::as_str).unwrap_or("");
++    if action == "identity" {
++        println!(
++            "{}",
++            json!({"protocol":1,"wrapper_version":wrapper_version(),"managed":managed(),
++            "data_schema":1,"data_schema_min":1,"data_schema_max":1})
++        );
++        return;
++    }
++    let result = (|| {
++        let mut transaction = "";
++        let mut i = 1;
++        while i < args.len() {
++            let value = args
++                .get(i + 1)
++                .ok_or_else(|| error("missing managed-update option value"))?;
++            match args[i].as_str() {
++                "--transaction" if transaction.is_empty() => transaction = value,
++                "--installation" => set_installation(value)?,
++                _ => return Err(error("unknown or repeated managed-update option")),
++            }
++            i += 2;
++        }
++        let config = DaemonConfig::from_env_or_default_paths()?;
++        execute(&config, action, transaction)
++    })();
++    match result {
++        Ok(value) => println!("{value}"),
++        Err(e) => {
++            println!(
++                "{}",
++                json!({"protocol":1,"wrapper_version":wrapper_version(),"error":e.to_string(),"ready":false,"durable":false,"quiesced":false})
++            );
++            std::process::exit(1);
++        }
++    }
++}
++pub(crate) async fn wait_for_resume() {
++    while VALIDATING.load(Ordering::Acquire) {
++        tokio::time::sleep(Duration::from_millis(25)).await;
++    }
++}
++pub(crate) fn trigger_check() {
++    let Ok(exe) = std::env::current_exe() else {
++        return;
++    };
++    let Some(root) = exe.parent().and_then(Path::parent) else {
++        return;
++    };
++    if exe
++        .parent()
++        .and_then(Path::file_name)
++        .and_then(|n| n.to_str())
++        != Some(".tcli")
++    {
++        return;
++    }
++    let checker = root.join(if cfg!(windows) { "tcli.exe" } else { "tcli" });
++    if !checker.is_file() {
++        return;
++    }
++    let mut command = std::process::Command::new(&checker);
++    command
++        .args(["_update-check", "--source", "daemon", "--install"])
++        .arg(&checker)
++        .stdin(std::process::Stdio::null())
++        .stdout(std::process::Stdio::null())
++        .stderr(std::process::Stdio::null());
++    #[cfg(windows)]
++    {
++        use std::os::windows::process::CommandExt;
++        command.creation_flags(crate::utils::CREATE_NO_WINDOW);
++    }
++    if let Ok(mut child) = command.spawn() {
++        let _ = std::thread::spawn(move || child.wait());
++    }
++}
++#[cfg(windows)]
++mod platform;
++
++/// Validate stored schemas without writing to installed data. SQLite may leave a
++/// WAL when process-global connections are not destructed. Recover such a journal
++/// only in a private disposable snapshot, preserving the original byte-for-byte.
++fn validate_database(path: &Path, expected: u32, stream_schema: bool) -> Result<(), GitAiError> {
++    if !path.exists() {
++        return Ok(());
++    }
++    verify_path(path)?;
++    let snapshot = tempfile::tempdir()?;
++    #[cfg(windows)]
++    platform::make_private(snapshot.path())?;
++    let copy = snapshot.path().join("validation.sqlite");
++    fs::copy(path, &copy)?;
++    for suffix in ["-wal", "-journal"] {
++        let sidecar = PathBuf::from(format!("{}{suffix}", path.display()));
++        match fs::symlink_metadata(&sidecar) {
++            Ok(_) => {
++                verify_path(&sidecar)?;
++                fs::copy(
++                    &sidecar,
++                    snapshot.path().join(format!("validation.sqlite{suffix}")),
++                )?;
++            }
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
++            Err(e) => return Err(e.into()),
++        }
++    }
++    let connection = rusqlite::Connection::open_with_flags(
++        &copy,
++        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
++    )?;
++    let integrity: String = connection.query_row("PRAGMA quick_check(1)", [], |r| r.get(0))?;
++    if integrity != "ok" {
++        return Err(error(format!(
++            "database integrity check failed: {}",
++            path.display()
++        )));
++    }
++    let query = if stream_schema {
++        "SELECT CAST(MAX(version) AS INTEGER) FROM schema_version"
++    } else {
++        "SELECT CAST(value AS INTEGER) FROM schema_metadata WHERE key='version'"
++    };
++    let version: u32 = connection.query_row(query, [], |r| r.get(0))?;
++    if version != expected {
++        return Err(error(format!(
++            "database schema requires a separate migration: {} ({} != {})",
++            path.display(),
++            version,
++            expected
++        )));
++    }
++    Ok(())
++}
++pub(crate) fn offline_health(config: &DaemonConfig) -> Result<(), GitAiError> {
++    validate_database(
++        &crate::metrics::db::MetricsDatabase::database_path()?,
++        5,
++        false,
++    )?;
++    validate_database(&crate::notes::db::NotesDatabase::database_path()?, 1, false)?;
++    validate_database(
++        &crate::authorship::internal_db::InternalDatabase::database_path()?,
++        3,
++        false,
++    )?;
++    validate_database(&config.internal_dir.join("transcripts-db"), 4, true)?;
++    validate_database(&config.internal_dir.join("token-usage-db"), 2, true)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn managed_update_offline_health_preserves_wal_and_refuses_future_schema() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("db");
++        let conn = rusqlite::Connection::open(&path).unwrap();
++        conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE schema_metadata(key TEXT, value TEXT); INSERT INTO schema_metadata VALUES('version','5');").unwrap();
++        let wal = dir.path().join("db-wal");
++        let db_before = fs::read(&path).unwrap();
++        let wal_before = fs::read(&wal).unwrap();
++        validate_database(&path, 5, false).unwrap();
++        assert!(
++            validate_database(&path, 4, false)
++                .unwrap_err()
++                .to_string()
++                .contains("separate migration")
++        );
++        assert_eq!(fs::read(&path).unwrap(), db_before);
++        assert_eq!(fs::read(&wal).unwrap(), wal_before);
++    }
++    #[test]
++    fn managed_update_unresponsive_locked_daemon_is_never_reported_stopped() {
++        let dir = tempfile::tempdir().unwrap();
++        let config = DaemonConfig::from_home(dir.path());
++        config.ensure_parent_dirs().unwrap();
++        let _lifecycle = crate::daemon::DaemonLock::acquire(&config.lock_path).unwrap();
++        let result = inspect(&config).unwrap_err().to_string();
++        assert!(result.contains("lifecycle lock held"));
++        assert!(
++            !directory(&config).exists(),
++            "inspection must not create maintenance state"
++        );
++    }
++
++    #[test]
++    fn managed_update_transaction_rejects_path_and_empty_tokens() {
++        assert!(valid_transaction("12345678-1234-1234-1234-123456789abc"));
++        for value in ["", "../transaction", "12345678-1234-1234-1234-123456789abz"] {
++            assert!(!valid_transaction(value));
++        }
++    }
++    #[test]
++    fn managed_update_state_survives_lock_release_and_rejects_wrong_transaction() {
++        let dir = tempfile::tempdir().unwrap();
++        let config = DaemonConfig::from_home(dir.path());
++        let transaction = crate::uuid::generate_v4();
++        {
++            let _guard = gate(&config).unwrap();
++            write(
++                &config,
++                &Maintenance {
++                    transaction: transaction.clone(),
++                    executable: std::env::current_exe().unwrap(),
++                    phase: "prepared".into(),
++                },
++            )
++            .unwrap();
++        }
++        assert!(owned(&config, &transaction).is_ok());
++        assert!(owned(&config, &crate::uuid::generate_v4()).is_err());
++        clear(&config).unwrap();
++        assert!(read(&config).unwrap().is_none());
++    }
++    #[cfg(unix)]
++    #[test]
++    fn managed_update_rejects_symlinked_state() {
++        let dir = tempfile::tempdir().unwrap();
++        let config = DaemonConfig::from_home(dir.path());
++        ensure_directory(&config).unwrap();
++        let target = dir.path().join("unrelated");
++        fs::write(&target, b"{}").unwrap();
++        std::os::unix::fs::symlink(&target, state_path(&config)).unwrap();
++        assert!(read(&config).is_err());
++    }
++}
+diff --git a/src/managed_update/platform.rs b/src/managed_update/platform.rs
+new file mode 100644
+index 0000000..4f4f3e3
+--- /dev/null
++++ b/src/managed_update/platform.rs
+@@ -0,0 +1,263 @@
++//! Windows ownership, protected DACL and durable replacement for maintenance state.
++use crate::error::GitAiError;
++use std::{ffi::c_void, os::windows::ffi::OsStrExt, path::Path, ptr};
++use windows_sys::Win32::{
++    Foundation::{CloseHandle, HANDLE, LocalFree},
++    Security::{
++        Authorization::{
++            ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
++            GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
++        },
++        DACL_SECURITY_INFORMATION, EqualSid, GetSecurityDescriptorDacl, GetTokenInformation,
++        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
++        TokenUser,
++    },
++    Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
++    System::Threading::{GetCurrentProcess, OpenProcessToken},
++};
++
++fn wide(path: &Path) -> Result<Vec<u16>, GitAiError> {
++    let mut value: Vec<u16> = path.as_os_str().encode_wide().collect();
++    if value.contains(&0) {
++        return Err(GitAiError::Generic("NUL in managed path".into()));
++    }
++    value.push(0);
++    Ok(value)
++}
++fn last_error() -> GitAiError {
++    std::io::Error::last_os_error().into()
++}
++struct Token(HANDLE);
++impl Drop for Token {
++    fn drop(&mut self) {
++        unsafe {
++            CloseHandle(self.0);
++        }
++    }
++}
++struct Local(*mut c_void);
++impl Drop for Local {
++    fn drop(&mut self) {
++        if !self.0.is_null() {
++            unsafe {
++                LocalFree(self.0);
++            }
++        }
++    }
++}
++struct CurrentUser {
++    _storage: Vec<usize>,
++    sid: *mut c_void,
++}
++fn current_user() -> Result<CurrentUser, GitAiError> {
++    unsafe {
++        let mut handle = ptr::null_mut();
++        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle) == 0 {
++            return Err(last_error());
++        }
++        let token = Token(handle);
++        let mut size = 0;
++        GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut size);
++        if size == 0 {
++            return Err(last_error());
++        }
++        let mut storage = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
++        if GetTokenInformation(
++            token.0,
++            TokenUser,
++            storage.as_mut_ptr().cast(),
++            size,
++            &mut size,
++        ) == 0
++        {
++            return Err(last_error());
++        }
++        let sid = (*(storage.as_ptr().cast::<TOKEN_USER>())).User.Sid;
++        Ok(CurrentUser {
++            _storage: storage,
++            sid,
++        })
++    }
++}
++pub(super) fn verify_owner(path: &Path) -> Result<(), GitAiError> {
++    let name = wide(path)?;
++    let user = current_user()?;
++    unsafe {
++        let mut owner = ptr::null_mut();
++        let mut descriptor = ptr::null_mut();
++        let result = GetNamedSecurityInfoW(
++            name.as_ptr(),
++            SE_FILE_OBJECT,
++            OWNER_SECURITY_INFORMATION,
++            &mut owner,
++            ptr::null_mut(),
++            ptr::null_mut(),
++            ptr::null_mut(),
++            &mut descriptor,
++        );
++        let _descriptor = Local(descriptor);
++        if result != 0 {
++            return Err(std::io::Error::from_raw_os_error(result as i32).into());
++        }
++        if owner.is_null() || EqualSid(owner, user.sid) == 0 {
++            return Err(GitAiError::Generic(
++                "managed update requires current-user ownership".into(),
++            ));
++        }
++    }
++    Ok(())
++}
++pub(super) fn make_private(path: &Path) -> Result<(), GitAiError> {
++    verify_owner(path)?;
++    let mut name = wide(path)?;
++    let user = current_user()?;
++    unsafe {
++        let mut sid_text = ptr::null_mut();
++        if ConvertSidToStringSidW(user.sid, &mut sid_text) == 0 {
++            return Err(last_error());
++        }
++        let _sid_text = Local(sid_text.cast());
++        let mut len = 0;
++        while *sid_text.add(len) != 0 {
++            len += 1;
++        }
++        let sid = String::from_utf16(std::slice::from_raw_parts(sid_text, len))
++            .map_err(|e| GitAiError::Generic(e.to_string()))?;
++        // Protected DACL. Child gate/lease files inherit only the current user's ACE.
++        let flags = if path.is_dir() { "OICI" } else { "" };
++        let sddl: Vec<u16> = format!("D:P(A;{flags};FA;;;{sid})")
++            .encode_utf16()
++            .chain(Some(0))
++            .collect();
++        let mut descriptor = ptr::null_mut();
++        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
++            sddl.as_ptr(),
++            1,
++            &mut descriptor,
++            ptr::null_mut(),
++        ) == 0
++        {
++            return Err(last_error());
++        }
++        let _descriptor = Local(descriptor);
++        let mut present = 0;
++        let mut defaulted = 0;
++        let mut dacl = ptr::null_mut();
++        if GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) == 0
++            || present == 0
++            || dacl.is_null()
++        {
++            return Err(last_error());
++        }
++        let result = SetNamedSecurityInfoW(
++            name.as_mut_ptr(),
++            SE_FILE_OBJECT,
++            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
++            ptr::null_mut(),
++            ptr::null_mut(),
++            dacl,
++            ptr::null_mut(),
++        );
++        if result != 0 {
++            return Err(std::io::Error::from_raw_os_error(result as i32).into());
++        }
++    }
++    Ok(())
++}
++pub(super) fn replace(from: &Path, to: &Path) -> Result<(), GitAiError> {
++    let from = wide(from)?;
++    let to = wide(to)?;
++    if unsafe {
++        MoveFileExW(
++            from.as_ptr(),
++            to.as_ptr(),
++            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
++        )
++    } == 0
++    {
++        return Err(last_error());
++    }
++    Ok(())
++}
++
++/// The dedicated namespace is protected and grants access only to its owner.
++/// Reject unexpected ACLs; never silently repair a possibly tampered namespace.
++pub(super) fn verify_private(path: &Path) -> Result<(), GitAiError> {
++    use windows_sys::Win32::Security::{
++        ACCESS_ALLOWED_ACE, ACE_HEADER, GetAce, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
++    };
++    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
++    verify_owner(path)?;
++    let name = wide(path)?;
++    let user = current_user()?;
++    unsafe {
++        let mut dacl = ptr::null_mut();
++        let mut descriptor = ptr::null_mut();
++        let result = GetNamedSecurityInfoW(
++            name.as_ptr(),
++            SE_FILE_OBJECT,
++            DACL_SECURITY_INFORMATION,
++            ptr::null_mut(),
++            ptr::null_mut(),
++            &mut dacl,
++            ptr::null_mut(),
++            &mut descriptor,
++        );
++        let _descriptor = Local(descriptor);
++        if result != 0 {
++            return Err(std::io::Error::from_raw_os_error(result as i32).into());
++        }
++        let mut control = 0;
++        let mut revision = 0;
++        if dacl.is_null()
++            || GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) == 0
++            || control & SE_DACL_PROTECTED == 0
++            || (*dacl).AceCount == 0
++        {
++            return Err(GitAiError::Generic(
++                "managed namespace requires a protected owner-only DACL".into(),
++            ));
++        }
++        for index in 0..(*dacl).AceCount {
++            let mut ace = ptr::null_mut();
++            if GetAce(dacl, u32::from(index), &mut ace) == 0 {
++                return Err(last_error());
++            }
++            let header = &*(ace.cast::<ACE_HEADER>());
++            if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE {
++                return Err(GitAiError::Generic(
++                    "unexpected ACE in managed namespace".into(),
++                ));
++            }
++            let allowed = &*(ace.cast::<ACCESS_ALLOWED_ACE>());
++            let sid = ptr::addr_of!(allowed.SidStart).cast::<c_void>();
++            if EqualSid(sid as *mut c_void, user.sid) == 0 {
++                return Err(GitAiError::Generic(
++                    "managed namespace grants another principal access".into(),
++                ));
++            }
++        }
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn managed_windows_private_state_remains_readable_and_replaceable() {
++        let dir = tempfile::tempdir().unwrap();
++        make_private(dir.path()).unwrap();
++        verify_private(dir.path()).unwrap();
++        let first = dir.path().join("state.json");
++        let next = dir.path().join("next.json");
++        std::fs::write(&first, b"old").unwrap();
++        std::fs::write(&next, b"new").unwrap();
++        make_private(&first).unwrap();
++        make_private(&next).unwrap();
++        verify_owner(&first).unwrap();
++        verify_private(&first).unwrap();
++        replace(&next, &first).unwrap();
++        assert_eq!(std::fs::read(&first).unwrap(), b"new");
++    }
++}
+diff --git a/src/metrics/db.rs b/src/metrics/db.rs
+index f70035c..ce10f25 100644
+--- a/src/metrics/db.rs
++++ b/src/metrics/db.rs
+@@ -178,6 +178,7 @@ impl MetricsDatabase {
+         let db_mutex = METRICS_DB.get_or_init(|| match Self::new() {
+             Ok(db) => Mutex::new(db),
+             Err(e) => {
++                crate::managed_update::record_data_failure();
+                 eprintln!("[Error] Failed to initialize metrics database: {}", e);
+                 Mutex::new(
+                     Self::new_fallback().expect("Failed to create fallback metrics database"),
+@@ -272,7 +273,7 @@ impl MetricsDatabase {
+     }
+ 
+     /// Get database path: ~/.git-ai/internal/metrics-db
+-    fn database_path() -> Result<PathBuf, GitAiError> {
++    pub(crate) fn database_path() -> Result<PathBuf, GitAiError> {
+         // Allow test override via environment variable
+         #[cfg(any(test, feature = "test-support"))]
+         if let Ok(test_path) = std::env::var("GIT_AI_TEST_METRICS_DB_PATH") {
+diff --git a/src/notes/db.rs b/src/notes/db.rs
+index 197eefd..d3c1436 100644
+--- a/src/notes/db.rs
++++ b/src/notes/db.rs
+@@ -67,6 +67,7 @@ impl NotesDatabase {
+         let db_mutex = NOTES_DB.get_or_init(|| match Self::new() {
+             Ok(db) => Mutex::new(db),
+             Err(e) => {
++                crate::managed_update::record_data_failure();
+                 eprintln!("[Error] Failed to initialize notes database: {}", e);
+                 // Fall back to a temp file so the process can continue running.
+                 let temp_path = std::env::temp_dir().join("git-ai-notes-db-failed");
+@@ -123,7 +124,7 @@ impl NotesDatabase {
+     ///
+     /// In tests, the `GIT_AI_TEST_NOTES_DB_PATH` environment variable overrides
+     /// the default location so that test runs are isolated.
+-    fn database_path() -> Result<PathBuf, GitAiError> {
++    pub(crate) fn database_path() -> Result<PathBuf, GitAiError> {
+         #[cfg(any(test, feature = "test-support"))]
+         if let Ok(test_path) = std::env::var("GIT_AI_TEST_NOTES_DB_PATH") {
+             return Ok(PathBuf::from(test_path));
+diff --git a/tests/integration/main.rs b/tests/integration/main.rs
+index 5d8acdc..ef2d783 100644
+--- a/tests/integration/main.rs
++++ b/tests/integration/main.rs
+@@ -40,8 +40,8 @@ mod ci_local_skip_push;
+ mod ci_partial_clone;
+ mod ci_squash_rebase;
+ mod claude_code;
+-mod codebuddy_cwd;
+ mod cli_parser_rebase_args;
++mod codebuddy_cwd;
+ mod codex;
+ mod cold_trace2_repo;
+ mod commit_metric_metadata;
+@@ -92,6 +92,7 @@ mod jetbrains_download;
+ mod jetbrains_ide_types;
+ mod lite_mode;
+ mod log;
++mod managed_update;
+ mod merge_rebase;
+ mod metrics_retry_idle;
+ mod multi_repo_workspace;
+diff --git a/tests/integration/managed_update.rs b/tests/integration/managed_update.rs
+new file mode 100644
+index 0000000..4aeab18
+--- /dev/null
++++ b/tests/integration/managed_update.rs
+@@ -0,0 +1,338 @@
++use crate::repos::test_repo::{DaemonTestScope, TestRepo};
++use serde_json::Value;
++use std::{
++    process::{Child, Stdio},
++    time::{Duration, Instant},
++};
++struct ProcessGuard(Child);
++impl Drop for ProcessGuard {
++    fn drop(&mut self) {
++        let _ = self.0.kill();
++        let _ = self.0.wait();
++    }
++}
++fn command(repo: &TestRepo, args: &[&str]) -> std::process::Command {
++    let original = repo.git_ai_command_without_pre_sync_for_test(args, &[]);
++    let dir = repo.test_home_path().join(".tcli");
++    std::fs::create_dir_all(&dir).unwrap();
++    let binary = dir.join(if cfg!(windows) {
++        "git-ai.exe"
++    } else {
++        "git-ai"
++    });
++    if !binary.exists() {
++        std::fs::copy(original.get_program(), &binary).unwrap();
++    }
++    let mut cmd = std::process::Command::new(binary);
++    cmd.args(original.get_args());
++    for (key, value) in original.get_envs() {
++        if let Some(value) = value {
++            cmd.env(key, value);
++        } else {
++            cmd.env_remove(key);
++        }
++    }
++    if let Some(dir) = original.get_current_dir() {
++        cmd.current_dir(dir);
++    }
++    cmd
++}
++fn run(repo: &TestRepo, args: &[&str]) -> Result<String, String> {
++    let output = command(repo, args).output().unwrap();
++    if output.status.success() {
++        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
++    } else {
++        Err(String::from_utf8_lossy(&output.stderr).into_owned())
++    }
++}
++fn bridge(repo: &TestRepo, action: &str, token: &str) -> Result<Value, String> {
++    let output = command(repo, &["managed-update", action, "--transaction", token])
++        .output()
++        .unwrap();
++    let value: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
++        panic!(
++            "invalid bridge JSON: stdout={} stderr={}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr)
++        )
++    });
++    if output.status.success() {
++        Ok(value)
++    } else {
++        Err(value.to_string())
++    }
++}
++fn traced_git(repo: &TestRepo, args: &[&str]) -> Result<String, String> {
++    let config = git_ai::daemon::DaemonConfig::from_home(repo.test_home_path());
++    repo.git_with_env(
++        args,
++        &[
++            ("GIT_TRACE2_EVENT", config.trace2_event_target().as_str()),
++            ("GIT_TRACE2_EVENT_NESTING", "0"),
++        ],
++        None,
++    )
++}
++fn wait_running(repo: &TestRepo, token: &str) -> Value {
++    let deadline = Instant::now() + Duration::from_secs(20);
++    loop {
++        if let Ok(value) = bridge(repo, "inspect", token)
++            && value["running"] == true
++            && value["ready"] == true
++        {
++            return value;
++        }
++        assert!(
++            Instant::now() < deadline,
++            "daemon did not become ready: {:?}",
++            bridge(repo, "inspect", token)
++        );
++        std::thread::sleep(Duration::from_millis(25));
++    }
++}
++#[test]
++fn managed_update_stopped_runtime_keeps_daemon_stopped_and_blocks_start_until_abort() {
++    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
++    let token = git_ai::uuid::generate_v4();
++    let inspect = bridge(&repo, "inspect", &token).unwrap();
++    assert_eq!(inspect["running"], false);
++    assert!(
++        !repo
++            .test_home_path()
++            .join(".git-ai/internal/managed-update")
++            .exists(),
++        "inspect must remain read-only"
++    );
++    let prepared = bridge(&repo, "prepare", &token).unwrap();
++    assert_eq!(prepared["durable"], true);
++    assert!(bridge(&repo, "abort", &git_ai::uuid::generate_v4()).is_err());
++    let output = command(&repo, &["bg", "run"]).output().unwrap();
++    assert!(!output.status.success());
++    assert_eq!(bridge(&repo, "abort", &token).unwrap()["phase"], "normal");
++    assert_eq!(bridge(&repo, "abort", &token).unwrap()["running"], false);
++}
++#[test]
++fn managed_update_live_daemon_drains_stops_validates_and_resumes() {
++    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
++    let token = git_ai::uuid::generate_v4();
++    let mut child = ProcessGuard(
++        command(&repo, &["bg", "run"])
++            .stdin(Stdio::null())
++            .stdout(Stdio::null())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .unwrap(),
++    );
++    let before = wait_running(&repo, &token);
++    assert_eq!(before["protocol"], 1);
++    // Real trace2 commit/checkpoint work must survive the process replacement.
++    let file = repo.path().join("managed.txt");
++    std::fs::write(&file, "base\n").unwrap();
++    traced_git(&repo, &["add", "."]).unwrap();
++    traced_git(&repo, &["commit", "-m", "managed base"]).unwrap();
++    run(&repo, &["checkpoint", "human"]).unwrap();
++    std::fs::write(&file, "base\nai contribution\n").unwrap();
++    run(&repo, &["checkpoint", "mock_ai", "managed.txt"]).unwrap();
++    traced_git(&repo, &["add", "."]).unwrap();
++    traced_git(&repo, &["commit", "-m", "managed attribution"]).unwrap();
++    let deadline = Instant::now() + Duration::from_secs(20);
++    while bridge(&repo, "inspect", &token).unwrap()["busy"] == true {
++        assert!(
++            Instant::now() < deadline,
++            "accepted repository work did not drain"
++        );
++        std::thread::sleep(Duration::from_millis(25));
++    }
++    // A foreground command waiting for hook input owns an OS lease, so prepare
++    // cannot mistake a quiet daemon for an idle installation.
++    let mut foreground = ProcessGuard(
++        command(&repo, &["checkpoint", "codex", "--hook-input", "stdin"])
++            .stdin(Stdio::piped())
++            .stdout(Stdio::null())
++            .stderr(Stdio::null())
++            .spawn()
++            .unwrap(),
++    );
++    let deadline = Instant::now() + Duration::from_secs(5);
++    while bridge(&repo, "inspect", &token).unwrap()["busy"] != true {
++        assert!(Instant::now() < deadline, "foreground lease not observed");
++        std::thread::sleep(Duration::from_millis(10));
++    }
++    assert!(
++        bridge(&repo, "prepare", &token)
++            .unwrap_err()
++            .contains("busy")
++    );
++    drop(foreground.0.stdin.take());
++    foreground.0.wait().unwrap();
++    let prepared = bridge(&repo, "prepare", &token).unwrap();
++    assert_eq!(prepared["quiesced"], true);
++    assert_eq!(prepared["durable"], true);
++    let authorship_before = repo.git(&["notes", "--ref=ai", "show", "HEAD"]).unwrap();
++    assert!(
++        authorship_before.contains("mock_ai"),
++        "real checkpoint attribution missing"
++    );
++    let status = command(&repo, &["status"]).output().unwrap();
++    assert_eq!(status.status.code(), Some(75));
++    let stopped = bridge(&repo, "stop", &token).unwrap();
++    assert_eq!(stopped["phase"], "stopping");
++    let deadline = Instant::now() + Duration::from_secs(20);
++    while child.0.try_wait().unwrap().is_none() {
++        assert!(Instant::now() < deadline, "daemon did not exit gracefully");
++        std::thread::sleep(Duration::from_millis(25));
++    }
++    let validation = bridge(&repo, "start", &token).unwrap();
++    assert_eq!(validation["phase"], "validating");
++    assert_eq!(validation["ready"], true);
++    assert_ne!(validation["pid"], before["pid"]);
++    assert_eq!(bridge(&repo, "health", &token).unwrap()["validation"], true);
++    let resumed = bridge(&repo, "resume", &token).unwrap();
++    assert_eq!(resumed["phase"], "normal");
++    assert_eq!(resumed["validation"], false);
++    assert_eq!(
++        repo.git(&["notes", "--ref=ai", "show", "HEAD"]).unwrap(),
++        authorship_before
++    );
++    bridge(&repo, "prepare", &token).unwrap();
++    bridge(&repo, "stop", &token).unwrap();
++    let deadline = Instant::now() + Duration::from_secs(20);
++    loop {
++        if let Ok(value) = bridge(&repo, "inspect", &token)
++            && value["running"] == false
++        {
++            break;
++        }
++        assert!(Instant::now() < deadline, "validation daemon did not stop");
++        std::thread::sleep(Duration::from_millis(25));
++    }
++}
++
++#[test]
++fn managed_update_identity_is_offline_and_does_not_create_runtime_state() {
++    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
++    let value = bridge(&repo, "identity", "")
++        .expect("candidate identity must not contact the installed daemon");
++    assert_eq!(value["protocol"], 1);
++    assert_eq!(value["managed"], true);
++    assert_eq!(value["data_schema"], 1);
++    assert!(value["wrapper_version"].is_string());
++    assert!(
++        !repo
++            .test_home_path()
++            .join(".git-ai/internal/managed-update")
++            .exists()
++    );
++}
++
++#[test]
++fn managed_update_renamed_candidate_still_exposes_offline_identity() {
++    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
++    let original =
++        repo.git_ai_command_without_pre_sync_for_test(&["managed-update", "identity"], &[]);
++    let dir = tempfile::tempdir().unwrap();
++    let candidate = dir.path().join(if cfg!(windows) {
++        "bridge-git-ai.exe"
++    } else {
++        "bridge-git-ai"
++    });
++    std::fs::copy(original.get_program(), &candidate).unwrap();
++    let output = std::process::Command::new(candidate)
++        .args(["managed-update", "identity"])
++        .output()
++        .unwrap();
++    assert!(
++        output.status.success(),
++        "renamed bridge incorrectly dispatched to Git: {}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
++    assert_eq!(value["managed"], true);
++}
++
++#[test]
++fn managed_update_binding_rejects_changed_home_even_when_daemon_stopped() {
++    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
++    let token = git_ai::uuid::generate_v4();
++    bridge(&repo, "prepare", &token).unwrap();
++    bridge(&repo, "abort", &token).unwrap();
++    let alternative = tempfile::tempdir().unwrap();
++    for action in ["inspect", "prepare"] {
++        let output = command(&repo, &["managed-update", action, "--transaction", &token])
++            .env("GIT_AI_DAEMON_HOME", alternative.path())
++            .output()
++            .unwrap();
++        assert!(
++            !output.status.success(),
++            "{action} missed installation binding"
++        );
++        assert!(String::from_utf8_lossy(&output.stdout).contains("runtime binding"));
++    }
++    let startup = command(&repo, &["bg", "run"])
++        .env("GIT_AI_DAEMON_HOME", alternative.path())
++        .output()
++        .unwrap();
++    assert!(!startup.status.success());
++    assert!(String::from_utf8_lossy(&startup.stderr).contains("runtime binding"));
++    let home_only = command(&repo, &["managed-update", "inspect"])
++        .env("HOME", alternative.path())
++        .output()
++        .unwrap();
++    assert!(
++        !home_only.status.success(),
++        "same runtime with a different data HOME must fail closed"
++    );
++    let output = command(&repo, &["status"])
++        .env("HOME", alternative.path())
++        .env("GIT_AI_DAEMON_HOME", alternative.path())
++        .output()
++        .unwrap();
++    assert_eq!(output.status.code(), Some(75));
++    assert!(
++        !alternative
++            .path()
++            .join(".git-ai/internal/managed-update")
++            .exists()
++    );
++}
++#[test]
++fn managed_update_stopped_health_rejects_corrupt_database_without_writing() {
++    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
++    let token = git_ai::uuid::generate_v4();
++    bridge(&repo, "prepare", &token).unwrap();
++    let path = repo
++        .test_home_path()
++        .join(".git-ai/internal/transcripts-db");
++    std::fs::write(&path, b"corrupt database").unwrap();
++    let original = std::fs::read(&path).unwrap();
++    assert!(bridge(&repo, "health", &token).is_err());
++    assert_eq!(std::fs::read(&path).unwrap(), original);
++    assert!(!path.with_file_name("transcripts-db-wal").exists());
++}
++
++#[test]
++fn managed_update_bg_start_preserves_binding_through_canonical_executable() {
++    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
++    // bg start canonicalizes the child executable, unlike direct bg run.
++    let mut start = command(&repo, &["bg", "start"]);
++    let db = repo.test_home_path().join("metrics.db");
++    start.env("GIT_AI_TEST_DB_PATH", &db);
++    let output = start.output().unwrap();
++    assert!(
++        output.status.success(),
++        "{}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    let token = git_ai::uuid::generate_v4();
++    for action in ["inspect", "prepare", "stop"] {
++        let output = command(&repo, &["managed-update", action, "--transaction", &token])
++            .env("GIT_AI_TEST_DB_PATH", &db)
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "{}",
++            String::from_utf8_lossy(&output.stdout)
++        );
++    }
++}

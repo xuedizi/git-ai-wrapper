@@ -9,6 +9,11 @@ on:
       version:
         description: "Release version, for example v1.7.0-tac.v0.1.0"
         required: true
+      publish:
+        description: "Publish only after the full native validation matrix succeeds"
+        type: boolean
+        default: false
+        required: true
 
 permissions:
   contents: write
@@ -86,7 +91,9 @@ jobs:
             exit 1
           fi
           echo "ARCH_EVIDENCE platform=${{ matrix.platform }} runner=$RUNNER_ARCH"
-      - name: Build git-ai sidecar
+      - name: Build git-ai sidecar and test native managed lifecycle
+        env:
+          TAC_GIT_AI_NATIVE_MANAGED_TESTS: "1"
         shell: bash
         run: |
           version="${GITHUB_REF_NAME}"
@@ -128,6 +135,7 @@ jobs:
           if-no-files-found: error
 
   release:
+    if: github.event_name == 'push' || inputs.publish == true
     name: publish GitHub Release
     runs-on: ubuntu-latest
     needs: build

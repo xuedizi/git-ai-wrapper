@@ -101,6 +101,9 @@ if [ "$MODE" = rebase ]; then
 	exit 0
 fi
 
+if [ "${TAC_GIT_AI_NATIVE_MANAGED_TESTS:-0}" = 1 ]; then
+  cp "$WORK/src/src/enterprise_metrics/embedded.rs" "$WORK/default-embedded.rs"
+fi
 cp "$WORK/embedded.rs" "$WORK/src/src/enterprise_metrics/embedded.rs"
 
 [ -n "$OUT" ] || { echo "build-git-ai.sh: --out required for build mode" >&2; exit 2; }
@@ -109,7 +112,7 @@ mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd -P)
 
 echo ">> building standalone git-ai executable via cargo (release)"
-(cd "$WORK/src" && cargo build --locked --release)
+(cd "$WORK/src" && TCLI_MANAGED_GIT_AI=1 cargo build --locked --release)
 
 exe="$WORK/src/target/release/git-ai"
 if [ -f "$WORK/src/target/release/git-ai.exe" ]; then
@@ -120,3 +123,12 @@ chmod 0755 "$exe" 2>/dev/null || true
 cp "$exe" "$OUT/$(basename "$exe")"
 echo ">> executable in $OUT:"
 ls -la "$OUT/$(basename "$exe")"
+
+# Release runners exercise managed lifecycle on their actual operating system.
+# Keep the shipped release image intact; isolated fixtures use disabled publisher
+# settings, so synthetic commits never enter the enterprise delivery service.
+if [ "${TAC_GIT_AI_NATIVE_MANAGED_TESTS:-0}" = 1 ]; then
+  cp "$WORK/default-embedded.rs" "$WORK/src/src/enterprise_metrics/embedded.rs"
+  (cd "$WORK/src" && TCLI_MANAGED_GIT_AI=1 cargo test --locked --features test-support --lib managed_update)
+  (cd "$WORK/src" && TCLI_MANAGED_GIT_AI=1 cargo test --locked --features test-support --test integration managed_update -- --test-threads 1)
+fi

@@ -42,3 +42,8 @@ Inactive diagnostic or recovery patches, if any, are documented in
   all Skills, and survives dry-run apply suggestions. Targeted uninstall is
   explicitly rejected. Includes parser and isolated TestRepo regressions.
   See [parameter contract](../docs/install-hooks-target.md).
+
+- `managed-update.patch` adds TCLI-owned maintenance, foreground leases and daemon
+  startup barriers, reversible local drain, graceful stop, validation/resume,
+  build identity, and the background paired TCLI checker. Apply after all three
+  preceding patches. See [protocol and validation](../docs/managed-update.md).

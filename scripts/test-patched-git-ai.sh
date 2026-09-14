@@ -38,6 +38,7 @@ expected_patch_names=(
 	"codebuddy-preset.patch"
 	"enterprise-metrics.patch"
 	"install-hooks-target.patch"
+	"managed-update.patch"
 )
 actual_patch_names=$(printf '%s\n' "${active_patch_names[@]}")
 expected_patch_names_text=$(printf '%s\n' "${expected_patch_names[@]}")
@@ -63,6 +64,10 @@ for patch_file in "${active_patch_files[@]}"; do
 	(cd "$WORK/src" && git apply "$patch_file")
 done
 
+# Existing TestRepo fixtures intentionally reuse one executable across many homes.
+# Exercise standalone behavior for those fixtures; managed lifecycle tests copy
+# a separate installation per home and enable the managed build explicitly.
+export TCLI_MANAGED_GIT_AI=0
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 # Local HTTP/TLS fixtures must not be routed through an external proxy.
 export NO_PROXY="127.0.0.1,localhost,${NO_PROXY:-${no_proxy:-}}"
@@ -75,3 +80,5 @@ echo ">> running patched upstream tests (cargo test)"
 (cd "$WORK/src" && cargo test --locked --test integration install_hooks_target)
 
 (cd "$WORK/src" && cargo test --locked --test integration codebuddy_cwd)
+
+(cd "$WORK/src" && TCLI_MANAGED_GIT_AI=1 cargo test --locked --test integration managed_update -- --test-threads 1)
