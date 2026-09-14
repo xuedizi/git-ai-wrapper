@@ -1859,13 +1859,13 @@ index 0000000..1e9c44a
 +                &config,
 +                &Maintenance {
 +                    transaction: transaction.clone(),
-+                    executable: std::env::current_exe().unwrap(),
++                    executable: installation().unwrap(),
 +                    phase: "prepared".into(),
 +                },
 +            )
 +            .unwrap();
 +        }
-+        assert!(owned(&config, &transaction).is_ok());
++        owned(&config, &transaction).expect("persisted installation identity must remain owned");
 +        assert!(owned(&config, &crate::uuid::generate_v4()).is_err());
 +        clear(&config).unwrap();
 +        assert!(read(&config).unwrap().is_none());

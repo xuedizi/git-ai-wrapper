@@ -1,23 +1,23 @@
 {
-  "source_digest": "b1074d4152ffa5a478084e45d42a9de5c4288a3ba4d59c74d883bad2e3301cc2",
+  "source_digest": "4ff801212d3bb4f239b69e61268729cc1a142fcee7662ee69a580f331ae8858f",
   "bundles": {
     "linux-amd64": {
-      "sha256": "e77d952e20536a5b04af945f621f9885b6bfe045eafab5ba5a29436371eb3a40"
+      "sha256": "adb5c802d45354fd3c011e6b0f91cb5f0ec3b64e640d3cc21869ef057ef5fa5c"
     },
     "linux-arm64": {
-      "sha256": "009eb6ab2806e44cd0de25b0f2f6c102de29546b0244dcac331e43b2d5882d24"
+      "sha256": "4e9acbbc99c089257b0029f967fbd4e094442607cc2ec7cd0cee3f43b62bad65"
     },
     "darwin-amd64": {
-      "sha256": "344a5609b513be6386256abb9d9ca8803ac7c5542fea552ca9a795b325b6e23f"
+      "sha256": "b63817a53c46603d375741843743f26d93bea3277cceeb966f292430450601f4"
     },
     "darwin-arm64": {
-      "sha256": "ab18d871a30ad8dc15057a76d4273fac235daf249b02e126c2b485274b89639e"
+      "sha256": "3960e2c901da235007e1ed087079c1682ba71a7d1585b51147271bbd5da45bee"
     },
     "windows-amd64": {
-      "sha256": "97f4aa13e22b19b81ef439f3570d0a9221815ef84c9abacb2ace89030fc73a5c"
+      "sha256": "63dbfcef0087dc63cbdb2c9268dea124070b4101711d00ac025dbbf1da02c79a"
     },
     "windows-arm64": {
-      "sha256": "bc3c1d3cf7cdc78f7191a12336055e0a0119b69b716efc78666aeb95510ff4d1"
+      "sha256": "7771c70315b91507d04c1acb5dd1be57c500f7e47645381fc8c2055e5072182f"
     }
   }
 }
