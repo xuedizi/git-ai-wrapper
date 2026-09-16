@@ -1,0 +1,21 @@
+.ci/tcli-validation/manifest.json
+  s_3f30323367cf51::t_59d2069f862eab 2,5,8,11,14,17,20
+patches/managed-update.patch
+  s_3f30323367cf51::t_a34cbe0e5c5449 1862,1868
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "29e4cbae8c29203a6fa3769483cf706f8b3c0ac8",
+  "prompts": {},
+  "sessions": {
+    "s_3f30323367cf51": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a09e77-9632-78b2-8b59-963d150dfe97",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "tinkerxi <tinkerxi@tinnove.com.cn>"
+    }
+  }
+}

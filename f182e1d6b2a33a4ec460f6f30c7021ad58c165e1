@@ -1,0 +1,25 @@
+.ci/tcli-validation/manifest.json
+  s_3f30323367cf51::t_09a6c2db397761 1-23
+.github/workflows/managed-client-validation.yml
+  s_3f30323367cf51::t_e934b3203d5713 1-126
+scripts/run-managed-client-validation.py
+  s_3f30323367cf51::t_491d1fd7762626 1-170
+scripts/run_managed_client_validation_test.py
+  s_3f30323367cf51::t_0c50878b1ff56c 1-109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f182e1d6b2a33a4ec460f6f30c7021ad58c165e1",
+  "prompts": {},
+  "sessions": {
+    "s_3f30323367cf51": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a09e77-9632-78b2-8b59-963d150dfe97",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "tinkerxi <tinkerxi@tinnove.com.cn>"
+    }
+  }
+}

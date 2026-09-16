@@ -1,0 +1,31 @@
+.github/workflows/release.yml
+  s_3f30323367cf51::t_e297d0b70aaeda 12-16,94-96,138
+README.md
+  s_3f30323367cf51::t_32f988f978920a 17,35-36,55,102-103
+docs/managed-update.md
+  s_3f30323367cf51::t_ce04aaf703f0a1 1-149
+patches/README.md
+  s_3f30323367cf51::t_2a714818f26a3d 45-49
+patches/managed-update.patch
+  s_3f30323367cf51::t_2b67e0969b386e 1-2549
+scripts/build-git-ai.sh
+  s_3f30323367cf51::t_b70ddd96ad4e19 104-106,115,126-134
+scripts/test-patched-git-ai.sh
+  s_3f30323367cf51::t_6bf380527265fb 41,67-70,83-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8cadd2cb70cb5cdc15ac7ce83508b22618679158",
+  "prompts": {},
+  "sessions": {
+    "s_3f30323367cf51": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a09e77-9632-78b2-8b59-963d150dfe97",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "tinkerxi <tinkerxi@tinnove.com.cn>"
+    }
+  }
+}

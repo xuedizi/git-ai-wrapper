@@ -1,0 +1,21 @@
+.github/workflows/managed-client-validation.yml
+  s_3f30323367cf51::t_05f66a1bf0850a 4-12
+.github/workflows/release.yml
+  s_3f30323367cf51::t_a643c2e80f9223 12-16,27-36,38,52,155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "c73dde4c2df17a5f917fa9305763e1571d6c4835",
+  "prompts": {},
+  "sessions": {
+    "s_3f30323367cf51": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a09e77-9632-78b2-8b59-963d150dfe97",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "tinkerxi <tinkerxi@tinnove.com.cn>"
+    }
+  }
+}

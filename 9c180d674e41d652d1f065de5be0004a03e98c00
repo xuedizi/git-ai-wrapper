@@ -1,0 +1,23 @@
+docs/managed-update.md
+  s_3f30323367cf51::t_0deed7be3646bf 122-131
+patches/managed-update.patch
+  s_3f30323367cf51::t_40ceba41a5c43b 4-13,21-25
+scripts/test-patched-git-ai.sh
+  s_3f30323367cf51::t_df24cd4025d77e 67-71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "9c180d674e41d652d1f065de5be0004a03e98c00",
+  "prompts": {},
+  "sessions": {
+    "s_3f30323367cf51": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a09e77-9632-78b2-8b59-963d150dfe97",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "tinkerxi <tinkerxi@tinnove.com.cn>"
+    }
+  }
+}
