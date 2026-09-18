@@ -16,12 +16,15 @@ For example, `v1.7.0-tac.v0.2.0` is built from
 
 The wrapper intentionally carries four active downstream patches:
 
-- `codebuddy-preset.patch` adds first-class CodeBuddy support. CodeBuddy's
+- `codebuddy-preset.patch` adds first-class CodeBuddy and WorkBuddy support in the same patch. CodeBuddy's
   hook protocol is compatible with Claude Code, but its transcript stores the
   model in a structured `providerData.model` field (rather than Claude's
-  `message.model`). The patch adds a `codebuddy` preset, a `CodebuddyJsonl`
+  `message.model`). The patch adds `codebuddy` and `workbuddy` presets, a `CodebuddyJsonl`
   stream format with a dedicated model extractor, a `Codebuddy` tool classifier,
-  and a `CodebuddyInstaller` that writes hooks into `~/.codebuddy/settings.json`.
+  and a `CodebuddyInstaller` that writes hooks into `~/.codebuddy/settings.json` and
+  `~/.workbuddy/settings.json`, respectively. Both tools share parsing and model
+  extraction while retaining distinct attribution and session IDs. Use
+  `git-ai install-hooks --target workbuddy --dry-run=false` to install only WorkBuddy hooks.
   Subagent-parent detection is intentionally deferred to a later version.
   Invalid event working directories fall back to the hook process directory,
   preserving valid CLI event directories; see [CLI/IDE cwd compatibility](docs/codebuddy-cwd.md).
@@ -104,7 +107,7 @@ platform:
 
 The `patch-tests` job applies all four active patches to a clean pinned checkout and
 runs the library suite (including TCLI layout and timer tests), enterprise/installer
-regressions, and CodeBuddy cwd tests before native release builds.
+regressions, and CodeBuddy/WorkBuddy cwd and WorkBuddy hook-installation tests before native release builds.
 
 Remove the CodeBuddy patch only after a released upstream tag contains both the
 source behavior and equivalent regression coverage. Rollback must restore the

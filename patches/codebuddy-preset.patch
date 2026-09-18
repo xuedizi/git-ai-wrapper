@@ -1,5 +1,5 @@
 diff --git a/src/commands/checkpoint_agent/bash_tool.rs b/src/commands/checkpoint_agent/bash_tool.rs
-index 3dc8883..9990002 100644
+index 3dc888327..999000257 100644
 --- a/src/commands/checkpoint_agent/bash_tool.rs
 +++ b/src/commands/checkpoint_agent/bash_tool.rs
 @@ -387,6 +387,11 @@ pub fn classify_tool(agent: Agent, tool_name: &str) -> ToolClass {
@@ -24,9 +24,10 @@ index 3dc8883..9990002 100644
  // ---------------------------------------------------------------------------
 diff --git a/src/commands/checkpoint_agent/presets/codebuddy.rs b/src/commands/checkpoint_agent/presets/codebuddy.rs
 new file mode 100644
+index 000000000..f8d5573a4
 --- /dev/null
 +++ b/src/commands/checkpoint_agent/presets/codebuddy.rs
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,377 @@
 +use super::parse;
 +use super::{
 +    AgentPreset, ParsedHookEvent, PostBashCall, PostFileEdit, PreBashCall, PreFileEdit,
@@ -41,6 +42,7 @@ new file mode 100644
 +use std::path::{Path, PathBuf};
 +
 +pub struct CodebuddyPreset;
++pub struct WorkbuddyPreset;
 +
 +fn validate_cwd(path: &Path) -> Result<(), String> {
 +    if !path.is_absolute() {
@@ -55,7 +57,7 @@ new file mode 100644
 +// CodeBuddy CN IDE can send cwd="/" despite starting the hook in the project.
 +// Preserve valid CLI event directories (including subdirectories); only then
 +// fall back to the actual process cwd. Never use PWD or change the process cwd.
-+fn resolve_cwd(data: &serde_json::Value) -> Result<PathBuf, GitAiError> {
++fn resolve_cwd(data: &serde_json::Value, tool: &str) -> Result<PathBuf, GitAiError> {
 +    let event_cwd = parse::optional_str(data, "cwd");
 +    let event_error = match event_cwd {
 +        Some(cwd) => match validate_cwd(Path::new(cwd)) {
@@ -66,12 +68,12 @@ new file mode 100644
 +    };
 +    let process_cwd = std::env::current_dir().map_err(|error| {
 +        GitAiError::PresetError(format!(
-+            "CodeBuddy cwd resolution failed: event cwd={event_cwd:?}: {event_error}; getcwd failed: {error}"
++            "{tool} cwd resolution failed: event cwd={event_cwd:?}: {event_error}; getcwd failed: {error}"
 +        ))
 +    })?;
 +    if let Err(process_error) = validate_cwd(&process_cwd) {
 +        return Err(GitAiError::PresetError(format!(
-+            "CodeBuddy cwd resolution failed: event cwd={event_cwd:?}: {event_error}; getcwd={}: {process_error}; no directory selected",
++            "{tool} cwd resolution failed: event cwd={event_cwd:?}: {event_error}; getcwd={}: {process_error}; no directory selected",
 +            process_cwd.display()
 +        )));
 +    }
@@ -81,120 +83,136 @@ new file mode 100644
 +        selected_cwd = %process_cwd.display(),
 +        cwd_source = "getcwd",
 +        reason = %event_error,
-+        "CodeBuddy invalid event cwd; using hook process directory"
++        tool,
++        "Invalid event cwd; using hook process directory"
 +    );
 +    Ok(process_cwd)
 +}
 +
 +impl AgentPreset for CodebuddyPreset {
 +    fn parse(&self, hook_input: &str, trace_id: &str) -> Result<Vec<ParsedHookEvent>, GitAiError> {
-+        let data: serde_json::Value = serde_json::from_str(hook_input)
-+            .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
++        parse_buddy_hook(hook_input, trace_id, "codebuddy")
++    }
++}
 +
-+        // CodeBuddy tool names match Claude Code (Write/Edit/MultiEdit/Bash).
-+        let tool_class = parse::optional_str_multi(&data, &["tool_name", "toolName"])
-+            .map(|name| bash_tool::classify_tool(Agent::Codebuddy, name))
-+            .unwrap_or(ToolClass::FileEdit);
-+        if tool_class == ToolClass::Skip {
-+            return Ok(Vec::new());
-+        }
++impl AgentPreset for WorkbuddyPreset {
++    fn parse(&self, hook_input: &str, trace_id: &str) -> Result<Vec<ParsedHookEvent>, GitAiError> {
++        parse_buddy_hook(hook_input, trace_id, "workbuddy")
++    }
++}
 +
-+        let resolved_cwd = resolve_cwd(&data)?;
-+        let cwd = resolved_cwd.to_str().ok_or_else(|| {
-+            GitAiError::PresetError("CodeBuddy getcwd is not valid UTF-8".to_string())
-+        })?;
-+        let transcript_path = parse::required_str(&data, "transcript_path")?;
++// Both products use the same hook protocol and transcript format.
++fn parse_buddy_hook(
++    hook_input: &str,
++    trace_id: &str,
++    tool: &str,
++) -> Result<Vec<ParsedHookEvent>, GitAiError> {
++    let data: serde_json::Value = serde_json::from_str(hook_input)
++        .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
 +
-+        // Session ID: prefer hook `session_id` / `sessionId`, fall back to the
-+        // transcript filename stem (mirrors the Claude preset).
-+        let session_id = parse::optional_str(&data, "session_id")
-+            .or_else(|| parse::optional_str(&data, "sessionId"))
-+            .map(|s| s.to_string())
-+            .unwrap_or_else(|| {
-+                parse::required_file_stem(&data, "transcript_path")
-+                    .unwrap_or_else(|_| "unknown".to_string())
-+            });
++    // CodeBuddy tool names match Claude Code (Write/Edit/MultiEdit/Bash).
++    let tool_class = parse::optional_str_multi(&data, &["tool_name", "toolName"])
++        .map(|name| bash_tool::classify_tool(Agent::Codebuddy, name))
++        .unwrap_or(ToolClass::FileEdit);
++    if tool_class == ToolClass::Skip {
++        return Ok(Vec::new());
++    }
 +
-+        let hook_event = parse::optional_str_multi(&data, &["hook_event_name", "hookEventName"]);
-+        let tool_use_id = parse::str_or_default_multi(&data, &["tool_use_id", "toolUseId"], "bash");
++    let resolved_cwd = resolve_cwd(&data, tool)?;
++    let cwd = resolved_cwd
++        .to_str()
++        .ok_or_else(|| GitAiError::PresetError(format!("{tool} getcwd is not valid UTF-8")))?;
++    let transcript_path = parse::required_str(&data, "transcript_path")?;
 +
-+        let is_bash = tool_class == ToolClass::Bash;
-+
-+        let context = PresetContext {
-+            agent_id: AgentId {
-+                tool: "codebuddy".to_string(),
-+                id: session_id.clone(),
-+                // Prefer an explicit hook model. For auto/missing models, retain
-+                // the existing CLI transcript extraction before using the hook fallback.
-+                model: parse::optional_str(&data, "model")
-+                    .map(str::trim)
-+                    .filter(|model| !model.is_empty())
-+                    .filter(|model| *model != "auto")
-+                    .map(str::to_owned)
-+                    .or_else(|| {
-+                        crate::streams::model_extraction::extract_model(
-+                            Path::new(transcript_path),
-+                            crate::streams::sweep::StreamFormat::CodebuddyJsonl,
-+                            None,
-+                        )
-+                        .ok()
-+                        .flatten()
-+                    })
-+                    .or_else(|| {
-+                        parse::optional_str(&data, "model")
-+                            .map(str::trim)
-+                            .filter(|model| !model.is_empty())
-+                            .map(str::to_owned)
-+                    })
-+                    .unwrap_or_else(|| "unknown".to_string()),
-+            },
-+            external_session_id: session_id.clone(),
-+            trace_id: trace_id.to_string(),
-+            cwd: PathBuf::from(cwd),
-+            metadata: HashMap::from([("transcript_path".to_string(), transcript_path.to_string())]),
-+        };
-+
-+        let transcript_path_buf = PathBuf::from(transcript_path);
-+        // Subagent parent detection is intentionally not implemented in the
-+        // first version; CodeBuddy transcripts are treated as top-level.
-+        let stream_source = Some(StreamSource {
-+            path: transcript_path_buf,
-+            format: StreamFormat::CodebuddyJsonl,
-+            session_id: generate_session_id(&session_id, "codebuddy"),
-+            external_session_id: session_id.clone(),
-+            external_parent_session_id: None,
++    // Session ID: prefer hook `session_id` / `sessionId`, fall back to the
++    // transcript filename stem (mirrors the Claude preset).
++    let session_id = parse::optional_str(&data, "session_id")
++        .or_else(|| parse::optional_str(&data, "sessionId"))
++        .map(|s| s.to_string())
++        .unwrap_or_else(|| {
++            parse::required_file_stem(&data, "transcript_path")
++                .unwrap_or_else(|_| "unknown".to_string())
 +        });
 +
-+        let bash_command = parse::bash_command_from_hook_input(&data);
-+        let event = match (hook_event, is_bash) {
-+            (Some("PreToolUse"), true) => ParsedHookEvent::PreBashCall(PreBashCall {
-+                context,
-+                tool_use_id: tool_use_id.to_string(),
-+                command: bash_command,
-+            }),
-+            (Some("PreToolUse"), false) => ParsedHookEvent::PreFileEdit(PreFileEdit {
-+                context,
-+                file_paths: parse::file_paths_from_tool_input(&data, cwd),
-+                dirty_files: None,
-+                tool_use_id: Some(tool_use_id.to_string()),
-+            }),
-+            (_, true) => ParsedHookEvent::PostBashCall(PostBashCall {
-+                context,
-+                tool_use_id: tool_use_id.to_string(),
-+                command: bash_command,
-+                stream_source,
-+            }),
-+            (_, false) => ParsedHookEvent::PostFileEdit(PostFileEdit {
-+                context,
-+                file_paths: parse::file_paths_from_tool_input(&data, cwd),
-+                dirty_files: None,
-+                stream_source,
-+                tool_use_id: Some(tool_use_id.to_string()),
-+            }),
-+        };
++    let hook_event = parse::optional_str_multi(&data, &["hook_event_name", "hookEventName"]);
++    let tool_use_id = parse::str_or_default_multi(&data, &["tool_use_id", "toolUseId"], "bash");
 +
-+        Ok(vec![event])
-+    }
++    let is_bash = tool_class == ToolClass::Bash;
++
++    let context = PresetContext {
++        agent_id: AgentId {
++            tool: tool.to_string(),
++            id: session_id.clone(),
++            // Prefer an explicit hook model. For auto/missing models, retain
++            // the existing CLI transcript extraction before using the hook fallback.
++            model: parse::optional_str(&data, "model")
++                .map(str::trim)
++                .filter(|model| !model.is_empty())
++                .filter(|model| *model != "auto")
++                .map(str::to_owned)
++                .or_else(|| {
++                    crate::streams::model_extraction::extract_model(
++                        Path::new(transcript_path),
++                        crate::streams::sweep::StreamFormat::CodebuddyJsonl,
++                        None,
++                    )
++                    .ok()
++                    .flatten()
++                })
++                .or_else(|| {
++                    parse::optional_str(&data, "model")
++                        .map(str::trim)
++                        .filter(|model| !model.is_empty())
++                        .map(str::to_owned)
++                })
++                .unwrap_or_else(|| "unknown".to_string()),
++        },
++        external_session_id: session_id.clone(),
++        trace_id: trace_id.to_string(),
++        cwd: PathBuf::from(cwd),
++        metadata: HashMap::from([("transcript_path".to_string(), transcript_path.to_string())]),
++    };
++
++    let transcript_path_buf = PathBuf::from(transcript_path);
++    // Subagent parent detection is intentionally not implemented in the
++    // first version; CodeBuddy transcripts are treated as top-level.
++    let stream_source = Some(StreamSource {
++        path: transcript_path_buf,
++        format: StreamFormat::CodebuddyJsonl,
++        session_id: generate_session_id(&session_id, tool),
++        external_session_id: session_id.clone(),
++        external_parent_session_id: None,
++    });
++
++    let bash_command = parse::bash_command_from_hook_input(&data);
++    let event = match (hook_event, is_bash) {
++        (Some("PreToolUse"), true) => ParsedHookEvent::PreBashCall(PreBashCall {
++            context,
++            tool_use_id: tool_use_id.to_string(),
++            command: bash_command,
++        }),
++        (Some("PreToolUse"), false) => ParsedHookEvent::PreFileEdit(PreFileEdit {
++            context,
++            file_paths: parse::file_paths_from_tool_input(&data, cwd),
++            dirty_files: None,
++            tool_use_id: Some(tool_use_id.to_string()),
++        }),
++        (_, true) => ParsedHookEvent::PostBashCall(PostBashCall {
++            context,
++            tool_use_id: tool_use_id.to_string(),
++            command: bash_command,
++            stream_source,
++        }),
++        (_, false) => ParsedHookEvent::PostFileEdit(PostFileEdit {
++            context,
++            file_paths: parse::file_paths_from_tool_input(&data, cwd),
++            dirty_files: None,
++            stream_source,
++            tool_use_id: Some(tool_use_id.to_string()),
++        }),
++    };
++
++    Ok(vec![event])
 +}
 +
 +#[cfg(test)]
@@ -344,8 +362,51 @@ new file mode 100644
 +        }
 +    }
 +}
++
++#[cfg(test)]
++mod workbuddy_tests {
++    use super::super::resolve_preset;
++    use super::*;
++    use serde_json::json;
++
++    #[test]
++    fn workbuddy_preserves_identity_model_and_session_namespace() {
++        let repo = tempfile::tempdir().unwrap();
++        assert!(
++            std::process::Command::new("git")
++                .args(["init", "--quiet"])
++                .arg(repo.path())
++                .status()
++                .unwrap()
++                .success()
++        );
++        let transcript = repo.path().join("session.jsonl");
++        std::fs::write(
++            &transcript,
++            "{\"providerData\":{\"model\":\"buddy-model\"}}\n",
++        )
++        .unwrap();
++        for tool in ["codebuddy", "workbuddy"] {
++            let preset = resolve_preset(tool).unwrap();
++            let input = json!({"cwd": repo.path(), "transcript_path": transcript, "session_id": "shared-session", "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"file_path": "a.txt"}});
++            let events = preset.parse(&input.to_string(), "trace").unwrap();
++            match &events[0] {
++                ParsedHookEvent::PostFileEdit(e) => {
++                    assert_eq!(e.context.agent_id.tool, tool);
++                    assert_eq!(e.context.agent_id.model, "buddy-model");
++                    assert_eq!(e.file_paths, vec![repo.path().join("a.txt")]);
++                    assert_eq!(
++                        e.stream_source.as_ref().unwrap().session_id,
++                        generate_session_id("shared-session", tool)
++                    );
++                }
++                _ => panic!("expected file edit"),
++            }
++        }
++    }
++}
 diff --git a/src/commands/checkpoint_agent/presets/mod.rs b/src/commands/checkpoint_agent/presets/mod.rs
-index ca5828f..29f678a 100644
+index ca5828f7d..7f16b12c0 100644
 --- a/src/commands/checkpoint_agent/presets/mod.rs
 +++ b/src/commands/checkpoint_agent/presets/mod.rs
 @@ -5,6 +5,7 @@ mod ai_tab;
@@ -372,20 +433,21 @@ index ca5828f..29f678a 100644
              | Self::CopilotEventStreamJsonl => WatermarkType::ByteOffset,
              Self::DroidJsonl => WatermarkType::Hybrid,
              Self::CopilotSessionJson | Self::ContinueJson | Self::AmpThreadJson => {
-@@ -154,6 +157,7 @@ pub fn resolve_preset(name: &str) -> Result<Box<dyn AgentPreset>, GitAiError> {
+@@ -154,6 +157,8 @@ pub fn resolve_preset(name: &str) -> Result<Box<dyn AgentPreset>, GitAiError> {
      match name {
          "claude" => Ok(Box::new(claude::ClaudePreset)),
          "cline" => Ok(Box::new(cline::ClinePreset)),
 +        "codebuddy" => Ok(Box::new(codebuddy::CodebuddyPreset)),
++        "workbuddy" => Ok(Box::new(codebuddy::WorkbuddyPreset)),
          "codex" => Ok(Box::new(codex::CodexPreset)),
          "gemini" => Ok(Box::new(gemini::GeminiPreset)),
          "windsurf" => Ok(Box::new(windsurf::WindsurfPreset)),
 diff --git a/src/mdm/agents/codebuddy.rs b/src/mdm/agents/codebuddy.rs
 new file mode 100644
-index 0000000..5998358
+index 000000000..a1e49091d
 --- /dev/null
 +++ b/src/mdm/agents/codebuddy.rs
-@@ -0,0 +1,356 @@
+@@ -0,0 +1,398 @@
 +use crate::error::GitAiError;
 +use crate::mdm::hook_installer::{HookCheckResult, HookInstaller, HookInstallerParams};
 +use crate::mdm::utils::{
@@ -397,15 +459,32 @@ index 0000000..5998358
 +use std::path::{Path, PathBuf};
 +
 +// Command patterns for hooks
-+const CODEBUDDY_PRE_TOOL_CMD: &str = "checkpoint codebuddy --hook-input stdin";
-+const CODEBUDDY_POST_TOOL_CMD: &str = "checkpoint codebuddy --hook-input stdin";
 +const CODEBUDDY_CATCH_ALL_MATCHER: &str = "*";
 +
-+pub struct CodebuddyInstaller;
++pub struct CodebuddyInstaller {
++    tool: &'static str,
++    name: &'static str,
++}
 +
 +impl CodebuddyInstaller {
-+    fn settings_path() -> PathBuf {
-+        home_dir().join(".codebuddy").join("settings.json")
++    pub fn codebuddy() -> Self {
++        Self {
++            tool: "codebuddy",
++            name: "CodeBuddy",
++        }
++    }
++
++    pub fn workbuddy() -> Self {
++        Self {
++            tool: "workbuddy",
++            name: "WorkBuddy",
++        }
++    }
++
++    fn settings_path(&self) -> PathBuf {
++        home_dir()
++            .join(format!(".{}", self.tool))
++            .join("settings.json")
 +    }
 +
 +    fn hook_status(settings: &Value) -> (bool, bool) {
@@ -453,6 +532,7 @@ index 0000000..5998358
 +    }
 +
 +    fn install_hooks_at(
++        &self,
 +        settings_path: &Path,
 +        params: &HookInstallerParams,
 +        dry_run: bool,
@@ -474,8 +554,11 @@ index 0000000..5998358
 +        };
 +
 +        let binary_path_str = normalize_windows_path_for_shell(&params.binary_path);
-+        let pre_tool_cmd = format!("{} {}", binary_path_str, CODEBUDDY_PRE_TOOL_CMD);
-+        let post_tool_cmd = format!("{} {}", binary_path_str, CODEBUDDY_POST_TOOL_CMD);
++        let pre_tool_cmd = format!(
++            "{} checkpoint {} --hook-input stdin",
++            binary_path_str, self.tool
++        );
++        let post_tool_cmd = pre_tool_cmd.clone();
 +
 +        let mut merged = existing.clone();
 +        let mut hooks_obj = merged.get("hooks").cloned().unwrap_or_else(|| json!({}));
@@ -683,16 +766,16 @@ index 0000000..5998358
 +
 +impl HookInstaller for CodebuddyInstaller {
 +    fn name(&self) -> &str {
-+        "CodeBuddy"
++        self.name
 +    }
 +
 +    fn id(&self) -> &str {
-+        "codebuddy"
++        self.tool
 +    }
 +
 +    fn check_hooks(&self, _params: &HookInstallerParams) -> Result<HookCheckResult, GitAiError> {
-+        let has_binary = binary_exists("codebuddy");
-+        let has_dotfiles = home_dir().join(".codebuddy").exists();
++        let has_binary = binary_exists(self.tool);
++        let has_dotfiles = self.settings_path().parent().is_some_and(Path::exists);
 +
 +        if !has_binary && !has_dotfiles {
 +            return Ok(HookCheckResult {
@@ -702,7 +785,7 @@ index 0000000..5998358
 +            });
 +        }
 +
-+        let settings_path = Self::settings_path();
++        let settings_path = self.settings_path();
 +        if !settings_path.exists() {
 +            return Ok(HookCheckResult {
 +                tool_installed: true,
@@ -723,7 +806,7 @@ index 0000000..5998358
 +    }
 +
 +    fn process_names(&self) -> Vec<&str> {
-+        vec!["codebuddy"]
++        vec![self.tool, self.name]
 +    }
 +
 +    fn install_hooks(
@@ -731,7 +814,7 @@ index 0000000..5998358
 +        params: &HookInstallerParams,
 +        dry_run: bool,
 +    ) -> Result<Option<String>, GitAiError> {
-+        Self::install_hooks_at(&Self::settings_path(), params, dry_run)
++        self.install_hooks_at(&self.settings_path(), params, dry_run)
 +    }
 +
 +    fn uninstall_hooks(
@@ -739,11 +822,32 @@ index 0000000..5998358
 +        _params: &HookInstallerParams,
 +        dry_run: bool,
 +    ) -> Result<Option<String>, GitAiError> {
-+        Self::uninstall_hooks_at(&Self::settings_path(), dry_run)
++        Self::uninstall_hooks_at(&self.settings_path(), dry_run)
++    }
++}
++
++#[cfg(test)]
++mod workbuddy_tests {
++    #[test]
++    fn workbuddy_installer_is_registered_separately() {
++        let installers = crate::mdm::agents::get_all_installers();
++        for (id, name) in [("codebuddy", "CodeBuddy"), ("workbuddy", "WorkBuddy")] {
++            let installer = installers
++                .iter()
++                .find(|installer| installer.id() == id)
++                .expect("installer registered");
++            assert_eq!(installer.name(), name);
++            assert!(
++                installer
++                    .process_names()
++                    .iter()
++                    .any(|process| process.eq_ignore_ascii_case(id))
++            );
++        }
 +    }
 +}
 diff --git a/src/mdm/agents/mod.rs b/src/mdm/agents/mod.rs
-index 105a6e9..8b6b2c1 100644
+index 105a6e9e1..6534c0afe 100644
 --- a/src/mdm/agents/mod.rs
 +++ b/src/mdm/agents/mod.rs
 @@ -1,6 +1,7 @@
@@ -762,16 +866,17 @@ index 105a6e9..8b6b2c1 100644
  pub use codex::CodexInstaller;
  pub use cursor::CursorInstaller;
  pub use droid::DroidInstaller;
-@@ -40,6 +42,7 @@ pub fn get_all_installers() -> Vec<Box<dyn HookInstaller>> {
+@@ -40,6 +42,8 @@ pub fn get_all_installers() -> Vec<Box<dyn HookInstaller>> {
          Box::new(ClaudeCodeInstaller),
          Box::new(ClineInstaller),
          Box::new(CodexInstaller),
-+        Box::new(CodebuddyInstaller),
++        Box::new(CodebuddyInstaller::codebuddy()),
++        Box::new(CodebuddyInstaller::workbuddy()),
          Box::new(CursorInstaller),
          Box::new(VSCodeInstaller),
          Box::new(GitHubCopilotInstaller),
 diff --git a/src/streams/model_extraction.rs b/src/streams/model_extraction.rs
-index edce141..dc56c6e 100644
+index edce141a4..dc56c6e1d 100644
 --- a/src/streams/model_extraction.rs
 +++ b/src/streams/model_extraction.rs
 @@ -27,6 +27,7 @@ pub fn extract_model(
@@ -813,7 +918,7 @@ index edce141..dc56c6e 100644
      path: &Path,
      extract_from_line: fn(&str) -> Option<String>,
 diff --git a/src/streams/sweep.rs b/src/streams/sweep.rs
-index 3ae6136..88d09a7 100644
+index 3ae613625..88d09a719 100644
 --- a/src/streams/sweep.rs
 +++ b/src/streams/sweep.rs
 @@ -42,6 +42,7 @@ pub enum StreamFormat {
@@ -841,9 +946,10 @@ index 3ae6136..88d09a7 100644
              Self::DroidJsonl => WatermarkType::Hybrid,
              Self::CopilotSessionJson | Self::ContinueJson | Self::AmpThreadJson => {
 diff --git a/src/git/repository.rs b/src/git/repository.rs
+index 81c52da52..866069f1e 100644
 --- a/src/git/repository.rs
 +++ b/src/git/repository.rs
-@@ -2445,6 +2445,25 @@
+@@ -2445,6 +2445,25 @@ fn repository_from_discovered_paths(
      })
  }
  
@@ -870,9 +976,10 @@ diff --git a/src/git/repository.rs b/src/git/repository.rs
      let paths = discover_repository_paths_no_git_exec(path)?;
      repository_from_discovered_paths(
 diff --git a/tests/integration/main.rs b/tests/integration/main.rs
+index af4b46d2c..f473893b3 100644
 --- a/tests/integration/main.rs
 +++ b/tests/integration/main.rs
-@@ -40,6 +40,7 @@
+@@ -40,6 +40,7 @@ mod ci_local_skip_push;
  mod ci_partial_clone;
  mod ci_squash_rebase;
  mod claude_code;
@@ -881,32 +988,37 @@ diff --git a/tests/integration/main.rs b/tests/integration/main.rs
  mod codex;
  mod cold_trace2_repo;
 diff --git a/tests/integration/repos/test_repo.rs b/tests/integration/repos/test_repo.rs
+index 5f0d8e11b..463653d7b 100644
 --- a/tests/integration/repos/test_repo.rs
 +++ b/tests/integration/repos/test_repo.rs
-@@ -1014,6 +1014,7 @@
+@@ -1014,6 +1014,8 @@ fn is_known_checkpoint_preset(arg: &str) -> bool {
      matches!(
          arg,
          "claude"
 +            | "codebuddy"
++            | "workbuddy"
              | "codex"
              | "continue-cli"
              | "cursor"
 diff --git a/tests/integration/repos/test_file.rs b/tests/integration/repos/test_file.rs
+index 763439c4a..4edf5774b 100644
 --- a/tests/integration/repos/test_file.rs
 +++ b/tests/integration/repos/test_file.rs
-@@ -8,6 +8,7 @@
+@@ -8,6 +8,8 @@ use insta::assert_debug_snapshot;
  const AI_AUTHOR_NAMES: &[&str] = &[
      "mock_ai",
      "claude",
 +    "codebuddy",
++    "workbuddy",
      "continue-cli",
      "gpt",
      "copilot",
 diff --git a/tests/integration/codebuddy_cwd.rs b/tests/integration/codebuddy_cwd.rs
 new file mode 100644
+index 000000000..9b228611a
 --- /dev/null
 +++ b/tests/integration/codebuddy_cwd.rs
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,369 @@
 +use crate::repos::test_file::ExpectedLineExt;
 +use crate::repos::test_repo::TestRepo;
 +use git_ai::commands::checkpoint_agent::presets::{ParsedHookEvent, resolve_preset};
@@ -1091,15 +1203,15 @@ new file mode 100644
 +
 +#[test]
 +fn codebuddy_cwd_fallback_records_committed_ai_lines() {
-+    assert_fallback_records_committed_ai_lines("Write");
++    assert_fallback_records_committed_ai_lines("codebuddy", "Write");
 +}
 +
 +#[test]
 +fn codebuddy_cwd_bash_fallback_records_committed_ai_lines() {
-+    assert_fallback_records_committed_ai_lines("Bash");
++    assert_fallback_records_committed_ai_lines("codebuddy", "Bash");
 +}
 +
-+fn assert_fallback_records_committed_ai_lines(tool: &str) {
++fn assert_fallback_records_committed_ai_lines(preset: &str, tool: &str) {
 +    let repo = TestRepo::new();
 +    let file = repo.path().join("example.txt");
 +    fs::write(&file, "original\n").unwrap();
@@ -1116,7 +1228,7 @@ new file mode 100644
 +    });
 +    let checkpoint_output = repo
 +        .git_ai_with_stdin(
-+            &["checkpoint", "codebuddy", "--hook-input", "stdin"],
++            &["checkpoint", preset, "--hook-input", "stdin"],
 +            input.to_string().as_bytes(),
 +        )
 +        .unwrap();
@@ -1128,7 +1240,7 @@ new file mode 100644
 +    input["hook_event_name"] = json!("PostToolUse");
 +    let checkpoint_output = repo
 +        .git_ai_with_stdin(
-+            &["checkpoint", "codebuddy", "--hook-input", "stdin"],
++            &["checkpoint", preset, "--hook-input", "stdin"],
 +            input.to_string().as_bytes(),
 +        )
 +        .unwrap();
@@ -1152,7 +1264,7 @@ new file mode 100644
 +            .metadata
 +            .sessions
 +            .values()
-+            .any(|s| s.agent_id.tool == "codebuddy")
++            .any(|s| s.agent_id.tool == preset)
 +    );
 +}
 +
@@ -1208,8 +1320,76 @@ new file mode 100644
 +    repo.filename("New File.kt")
 +        .assert_committed_lines(crate::lines!["AI addition".ai()]);
 +}
++
++#[test]
++fn workbuddy_cwd_fallback_records_committed_ai_lines() {
++    assert_fallback_records_committed_ai_lines("workbuddy", "Write");
++}
++
++#[test]
++fn workbuddy_bash_fallback_records_committed_ai_lines() {
++    assert_fallback_records_committed_ai_lines("workbuddy", "Bash");
++}
++
++#[test]
++fn workbuddy_target_install_preserves_codebuddy_and_is_idempotent() {
++    use crate::repos::test_repo::DaemonTestScope;
++    let repo = TestRepo::new_with_daemon_scope(DaemonTestScope::NoDaemon);
++    let home = repo.test_home_path();
++    for tool in [".codebuddy", ".workbuddy"] {
++        fs::create_dir_all(home.join(tool)).unwrap();
++        fs::write(home.join(tool).join("settings.json"), r#"{"userSetting":true,"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"echo user-hook"}]}]}}"#).unwrap();
++    }
++    let codebuddy = fs::read(home.join(".codebuddy/settings.json")).unwrap();
++    let settings_path = home.join(".workbuddy/settings.json");
++    let mut previous = None;
++    for _ in 0..2 {
++        let output = repo
++            .git_ai_command_without_pre_sync_for_test(
++                &["install-hooks", "--target", "workbuddy", "--dry-run=false"],
++                &[],
++            )
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "{}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        let content = fs::read(&settings_path).unwrap();
++        let settings: Value = serde_json::from_slice(&content).unwrap();
++        assert_eq!(settings["userSetting"], true);
++        for event in ["PreToolUse", "PostToolUse"] {
++            let commands: Vec<&str> = settings["hooks"][event]
++                .as_array()
++                .unwrap()
++                .iter()
++                .flat_map(|block| block["hooks"].as_array().unwrap())
++                .filter_map(|hook| hook["command"].as_str())
++                .collect();
++            assert_eq!(
++                commands
++                    .iter()
++                    .filter(|cmd| cmd.contains("checkpoint workbuddy --hook-input stdin"))
++                    .count(),
++                1
++            );
++            if event == "PreToolUse" {
++                assert!(commands.contains(&"echo user-hook"));
++            }
++        }
++        if let Some(previous) = previous {
++            assert_eq!(content, previous);
++        }
++        previous = Some(content);
++        assert_eq!(
++            fs::read(home.join(".codebuddy/settings.json")).unwrap(),
++            codebuddy
++        );
++    }
++}
 diff --git a/src/commands/checkpoint_agent/presets/parse.rs b/src/commands/checkpoint_agent/presets/parse.rs
-index 2acd776..c260127 100644
+index 2acd7761b..c260127fa 100644
 --- a/src/commands/checkpoint_agent/presets/parse.rs
 +++ b/src/commands/checkpoint_agent/presets/parse.rs
 @@ -59,6 +59,7 @@ pub fn file_paths_from_tool_input(data: &Value, cwd: &str) -> Vec<PathBuf> {

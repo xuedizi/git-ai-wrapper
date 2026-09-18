@@ -5,19 +5,21 @@ Out-of-tree patches against upstream `git-ai-project/git-ai`, applied by
 directory are active build inputs.
 
 - `GIT_AI_VERSION` pins the upstream tag.
-- `codebuddy-preset.patch` adds first-class CodeBuddy support. CodeBuddy's hook
+- `codebuddy-preset.patch` adds first-class CodeBuddy and WorkBuddy support in one shared patch. CodeBuddy's hook
   protocol is compatible with Claude Code, but its JSONL transcript stores the
   model in a structured `providerData.model` field (unlike Claude's
   `message.model`). The patch adds:
-  - a `codebuddy` preset (`src/commands/checkpoint_agent/presets/codebuddy.rs`)
+  - `codebuddy` and `workbuddy` presets (`src/commands/checkpoint_agent/presets/codebuddy.rs`)
   - a `CodebuddyJsonl` stream format in both `StreamFormat` enums
   - a dedicated model extractor (`extract_model_from_codebuddy_jsonl_line`)
   - a `Codebuddy` tool classifier (reusing Claude's tool-name mapping)
   - a `CodebuddyInstaller` that writes `PreToolUse`/`PostToolUse` hooks into
-    `~/.codebuddy/settings.json`
+    `~/.codebuddy/settings.json` or `~/.workbuddy/settings.json`, respectively
+  - shared parsing/model extraction with separate tool and session identities
+  - registered `workbuddy` hook target (`install-hooks --target workbuddy`)
 
 General git-ai attribution, blame, stats, and Git-Notes behavior remains owned
-by upstream git-ai 1.7.0. The narrow downstream patch owns only CodeBuddy
+by upstream git-ai 1.7.0. The narrow downstream patch owns CodeBuddy/WorkBuddy
 preset and hook-installer support.
 
 Delete the CodeBuddy patch only after an upstream release carries both its
